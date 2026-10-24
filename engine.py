@@ -147,7 +147,7 @@ async def _post(model: str, state: str, questions: dict) -> dict:
     last = ""
     for attempt in range(1, 4):
         try:
-            async with httpx.AsyncClient(timeout=180) as c:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20)) as c:
                 r = await c.post(config.SYSTEMONE_URL, json=body)
         except (httpx.TransportError, httpx.TimeoutException) as x:
             last = f"{type(x).__name__}: {x}"

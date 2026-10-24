@@ -226,6 +226,9 @@ async def _linkedin(id: str, url: str) -> dict:
     import time as _t
     import brightdata
     job = LI_JOBS.get(id)
+    if job and job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
+        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
+        job.update({"snapshot": sid, "started": _t.time(), "retried": True})
     if not job:
         sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
         job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
