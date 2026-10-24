@@ -10,3 +10,4 @@ venv/
 .DS_Store
 .falkordb_test
 cache.txt
+.cache/

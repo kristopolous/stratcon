@@ -20,6 +20,9 @@ body{background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,sans-
 header{grid-column:1/4;display:flex;align-items:center;gap:16px;padding:0 18px;border-bottom:1px solid var(--line)}
 header b{font-size:16px;letter-spacing:.02em}
 header span{color:var(--dim);font-size:13px}
+#calbtn{background:#152019;border:1px solid #2f6b52;color:var(--yes);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer}
+#calbtn:disabled{opacity:.35;cursor:default}
+#calbtn:not(:disabled):hover{border-color:var(--yes)}
 #status{grid-column:1/4;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);padding:6px 18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #status.busy::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--gap);margin-right:8px;animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.2}}
@@ -155,7 +158,7 @@ header span{color:var(--dim);font-size:13px}
 </head>
 <body>
 <div class="app">
-  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span></header>
+  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span><button id="calbtn" disabled title="TrueForge agent calls the export_calendar MCP tool">Export plan to calendar (.ics)</button></header>
 
   <section class="chat">
     <div id="log"></div>
@@ -339,11 +342,25 @@ async function openEntity(id) {
     const box = document.createElement('div');
     box.innerHTML = `<div class="dsec">who is this</div><div class="dl dim">looking them up with Bright Data SERP API…</div>`;
     $('#dbox').insertBefore(box, $('#dbox').children[2]);
-    const p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
-    box.innerHTML = `<div class="dsec">who is this</div>` +
-      (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
-      (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
-      (p.cached ? `<div class="dl dim">from graph memory (FalkorDB)</div>` : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s · ${Math.round((q.bytes || 0) / 1024)} KB</div>`).join('') + `<div class="dl dim">saved to graph</div>`);
+    const render1 = p => {
+      const sc = p.scraper, pr = sc && sc.profile;
+      box.innerHTML = `<div class="dsec">who is this</div>` +
+        (pr ? `<div class="dl" style="display:flex;gap:12px;align-items:center">${pr.photo ? `<img src="${esc(pr.photo)}" style="width:64px;height:64px;border-radius:50%;object-fit:cover">` : ''}
+          <div><b>${esc(pr.name || e.name)}</b>${pr.company ? ` · ${esc(pr.company)}` : ''}${pr.city ? `<br><span class="dim">${esc(pr.city)}${pr.followers ? ` · ${pr.followers.toLocaleString()} followers` : ''}</span>` : ''}</div></div>` +
+          (pr.about ? `<div class="dl dim">${esc(pr.about)}</div>` : '') : '') +
+        (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
+        (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
+        (sc ? `<div class="dl" style="font:11.5px var(--mono);color:${sc.status === 'ready' ? 'var(--yes)' : 'var(--gap)'}">Bright Data ${esc(sc.product)} · snapshot ${esc(sc.snapshot || '')} · ${sc.status === 'ready' ? (sc.cached ? 'from graph memory' : `ready in ${((sc.ms || 0) / 1000).toFixed(0)}s`) : `running ${sc.elapsed}s…`}</div>` : '') +
+        (p.cached ? '' : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s</div>`).join(''));
+      if (pr && pr.photo) { E[e.id].logo = pr.photo; render(); }
+    };
+    let p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+    render1(p);
+    while (p.scraper && p.scraper.status === 'running' && $('#drawer').classList.contains('on')) {
+      await new Promise(r => setTimeout(r, 5000));
+      p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+      render1(p);
+    }
   }
 }
 
@@ -493,7 +510,7 @@ function handle(ev) {
       break;
     case 'rubric': crits = ev.criteria; renderHead(); render(); break;
     case 'reweight': trace(s, 'ag', `reweight ${esc(ev.crit)} ${ev.before} → ${ev.after}`); break;
-    case 'rank': rank = ev.rows; render(); break;
+    case 'rank': rank = ev.rows; render(); $('#calbtn').disabled = !rank.some(r => r.score > 0); break;
     case 'note': status(ev.text); trace(s, 's1', esc(ev.text)); break;
     case 'fill': status(`scoring the rest of the row for ${ev.n} new leaders`, 1); trace(s, 's1', `fill in: ${esc(ev.names.join(', '))}`); break;
     case 'memory': status(`recalled ${ev.n} scores from the graph`); trace(s, 'fk', `memory hit: ${ev.n} scores reused (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); break;
@@ -535,7 +552,7 @@ function handle(ev) {
       break;
     }
     case 'evidence':
-      if (ev.ok) { setCell(ev.e, ev.c, {calls: ev.calls}); trace(s, 'bd', `${esc(ev.product)} ✓ ${(ev.ms / 1000).toFixed(1)}s · ${(ev.bytes / 1024).toFixed(0)} KB · "${esc((ev.snippet || '').slice(0, 90))}…"`); }
+      if (ev.ok) { setCell(ev.e, ev.c, {calls: ev.calls}); trace(s, 'bd', `${esc(ev.product)} ✓ ${ev.cached ? 'cached (fetched earlier in ' + (ev.ms / 1000).toFixed(1) + 's)' : (ev.ms / 1000).toFixed(1) + 's'} · ${(ev.bytes / 1024).toFixed(0)} KB · "${esc((ev.snippet || '').slice(0, 90))}…"`); }
       else { setCell(ev.e, ev.c, {state: 'gap'}); render(); trace(s, 'bd', `${esc(ev.product || ev.strategy)} ✗ ${ev.error ? esc(ev.error) : 'nothing relevant'} — escalating`); }
       break;
     case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
@@ -544,7 +561,7 @@ function handle(ev) {
     case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1, 'Redirected'); tfBox = null;
       document.querySelectorAll('.cell.gap, .cell.route, .cell.fetch').forEach(() => {});
       Object.values(cells).forEach(c => { if (['gap', 'route', 'fetch'].includes(c.state)) c.state = 'done'; }); render(); break;
-    case 'done': busy = false; status(`ranked, explained and cited in ${(ev.ms / 1000).toFixed(1)}s — say something to redirect it`, 0, 'Done'); offerNext(); break;
+    case 'done': busy = false; status(`ranked, explained and cited in ${(ev.ms / 1000).toFixed(1)}s — say something to redirect it`, 0, 'Done'); offerNext(); lookupPeople(); break;
     case 'error': busy = false; status('error: ' + ev.text); trace(s, 'bd', 'error ' + esc(ev.text)); break;
   }
 }
@@ -579,11 +596,26 @@ const CLARIFY = {
   "I want to meet interesting people.": "No no, I mean academics and authors.",
   "I want to keep up with where AI coding is going.": "Specifically agent sandboxes and testing what agents write.",
 };
-let NEXT = ["Which talks should I go to for this?", "It's Wednesday 2pm and I'm at the conference. What now?", "Put my plan in my calendar."];
+let NEXT = ["Which talks should I go to for this?", "What kind of positions are they hiring for?", "It's Wednesday 2pm and I'm at the conference. What now?"];
 let nextI = 0;
 document.addEventListener('click', e => {
   if (e.target.classList.contains('starter') || e.target.classList.contains('next')) send(e.target.textContent);
 });
+$('#calbtn').addEventListener('click', () => send('Put my plan in my calendar.'));
+async function lookupPeople() {
+  const people = rank.filter(r => r.score > 0 && ['person', 'speaker'].includes(E[r.id]?.kind) && !(E[r.id].logo || '').includes('licdn')).slice(0, 3);
+  for (const r of people) {
+    trace(((Date.now() / 1000) - t0).toFixed(1) + 's', 'bd', `Bright Data LinkedIn people profiles → ${esc(E[r.id].name)}`);
+    let p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
+    for (let i = 0; i < 40 && p.scraper && p.scraper.status === 'running'; i++) {
+      await new Promise(res => setTimeout(res, 6000));
+      p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
+    }
+    const pr = p.scraper && p.scraper.profile;
+    if (pr && pr.photo) { E[r.id].logo = pr.photo; render(); }
+    if (pr) trace('', 'bd', `LinkedIn ✓ ${esc(pr.name || E[r.id].name)}${pr.company ? ' · ' + esc(pr.company) : ''}${pr.photo ? ' · photo' : ''}`);
+  }
+}
 function offerNext() {
   if (nextI >= NEXT.length) return;
   const b = document.createElement('button'); b.className = 'next'; b.textContent = NEXT[nextI];

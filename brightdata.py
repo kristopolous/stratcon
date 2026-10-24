@@ -6,6 +6,7 @@ import urllib.parse
 import httpx
 from playwright.async_api import async_playwright
 
+import cache
 import config
 
 API = "https://api.brightdata.com"
@@ -22,7 +23,26 @@ async def _request(url: str, data_format: str | None) -> tuple[int, str]:
         return r.status_code, r.text
 
 
+def _cached(product: str, target: str):
+    hit = cache.get("brightdata", cache.key(product, target))
+    if hit:
+        return {**hit, "cached": True}
+    return None
+
+
+def _store(res: dict) -> dict:
+    if res.get("status") == 200 and (res.get("text") or res.get("results")):
+        cache.put("brightdata", cache.key(res["product"], res["target"]), {**res, "text": (res.get("text") or "")[:60000]})
+    return res
+
+
 async def unlocker(url: str) -> dict:
+    if hit := _cached("Web Unlocker", url):
+        return hit
+    return _store(await _unlocker(url))
+
+
+async def _unlocker(url: str) -> dict:
     t = time.time()
     status, text = await _request(url, "markdown")
     return {"product": "Web Unlocker", "strategy": "read_site", "target": url, "status": status,
@@ -40,6 +60,12 @@ def _real_link(o: dict) -> str:
 
 
 async def serp(query: str) -> dict:
+    if hit := _cached("SERP API", query):
+        return hit
+    return _store(await _serp(query))
+
+
+async def _serp(query: str) -> dict:
     t = time.time()
     url = "https://www.google.com/search?" + urllib.parse.urlencode({"q": query, "gl": "us", "hl": "en", "brd_json": 1})
     status, text = await _request(url, None)
@@ -67,6 +93,14 @@ async def _ws() -> str:
 
 async def browser(url: str, scroll: int = 2, links_text: str | None = None,
                   click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
+    if not clicks and (hit := _cached("Browser API", url)):
+        return hit
+    res = await _browser(url, scroll, links_text, click_text, clicks, wait_text)
+    return _store(res) if not clicks else res
+
+
+async def _browser(url: str, scroll: int = 2, links_text: str | None = None,
+                   click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
     t = time.time()
     links, images = [], []
     async with async_playwright() as p:
@@ -108,3 +142,27 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
     return {"product": "Browser API", "strategy": "render_browser", "target": url, "status": 200,
             "bytes": len(text.encode()), "ms": int((time.time() - t) * 1000), "text": text, "links": links,
             "images": images}
+
+
+LINKEDIN_PEOPLE = "gd_l1viktl72bvl7bjuj0"
+
+
+async def dataset_trigger(dataset_id: str, inputs: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(f"{API}/datasets/v3/trigger", params={"dataset_id": dataset_id, "format": "json"},
+                         headers=HDR, json=inputs)
+        r.raise_for_status()
+        return r.json()["snapshot_id"]
+
+
+async def snapshot_progress(snapshot_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(f"{API}/datasets/v3/progress/{snapshot_id}", headers=HDR)
+        return r.json()
+
+
+async def snapshot_download(snapshot_id: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.get(f"{API}/datasets/v3/snapshot/{snapshot_id}", params={"format": "json"}, headers=HDR)
+        data = r.json()
+        return data if isinstance(data, list) else [data]
