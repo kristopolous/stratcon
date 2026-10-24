@@ -212,6 +212,7 @@ class Session:
         self.gen = 0
         self.tasks: list[asyncio.Task] = []
         self.calls: dict[str, list] = {}
+        self.pins: list[str] = []
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -282,7 +283,10 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
     return out, int((time.time() - t) * 1000)
 
 
-TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubric only through the stratcon tools: \
+TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """If the attendee ASKS A QUESTION about the recommendations (e.g. "what positions are they hiring for?", "who \
+works there?"), do NOT edit the rubric: call current_recommendations, then research (live web via Bright Data) \
+and/or graph_query (read-only FalkorDB Cypher), and answer in 2-3 sentences naming sources. \
+Edit the rubric only through the stratcon tools: \
 add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
 conference, Oct 28-29 2026), export_calendar (when they want their plan in a calendar); call get_rubric if you \
 need criterion ids. Make every edit \
@@ -334,7 +338,9 @@ async def agent_trueforge(session: "Session", text: str):
         res = c.sessions.create_turn_stream(
             session_id=session.tf_id,
             input=[t.UserMessage(type="user.message",
-                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\nAttendee says: {text}")])
+                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
+                                         f"Pinned by attendee: {json.dumps([ENTITIES[p]['name'] for p in session.pins])}\n"
+                                         f"Attendee says: {text}")])
         if inspect.isawaitable(res):
             res = await res
         async for e in res:

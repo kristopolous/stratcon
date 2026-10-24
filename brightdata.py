@@ -29,6 +29,16 @@ async def unlocker(url: str) -> dict:
             "bytes": len(text.encode()), "ms": int((time.time() - t) * 1000), "text": text if status == 200 else ""}
 
 
+def _real_link(o: dict) -> str:
+    link = o.get("link", "")
+    if "google.com/goto" not in link and "google.com/url" not in link:
+        return link
+    shown = o.get("display_link", "")
+    if "…" in shown or "..." in shown:
+        shown = shown.split(" › ")[0]
+    return shown.replace(" › ", "/").strip() or link
+
+
 async def serp(query: str) -> dict:
     t = time.time()
     url = "https://www.google.com/search?" + urllib.parse.urlencode({"q": query, "gl": "us", "hl": "en", "brd_json": 1})
@@ -37,7 +47,7 @@ async def serp(query: str) -> dict:
     if status == 200:
         try:
             for o in json.loads(text).get("organic", [])[:6]:
-                results.append({"title": o.get("title", ""), "link": o.get("link", ""), "description": o.get("description", "")})
+                results.append({"title": o.get("title", ""), "link": _real_link(o), "description": o.get("description", "")})
         except ValueError:
             pass
     return {"product": "SERP API", "strategy": "web_search", "target": query, "status": status,

@@ -46,6 +46,7 @@ async def entities():
 async def turn(req: Request):
     body = await req.json()
     s = session(body["sid"])
+    s.pins = [p for p in body.get("pins", []) if p in engine.ENTITIES]
     if getattr(s, "current", None) and not s.current.done():
         s.current.cancel()
         for t in s.tasks:
@@ -155,6 +156,11 @@ async def entity(sid: str, id: str):
         rows, ms = await engine.gq(cy, {"id": id})
         related = [{"label": "presents", "id": ti, "name": tn, "when": tw, "room": tr} for ti, tn, tw, tr in rows]
         queries.append({"cypher": cy, "ms": ms})
+        cy = "MATCH (p {id:$id})-[:WORKS_AT]->(s:Entity) RETURN s.id, s.name, s.tier"
+        rows, ms = await engine.gq(cy, {"id": id})
+        related += [{"label": "at the booth of", "id": si, "name": sn, "when": f"{st} sponsor", "room": "expo hall"}
+                    for si, sn, st in rows]
+        queries.append({"cypher": cy, "ms": ms})
     elif e["kind"] == "talk":
         cy = ("MATCH (p:Person)-[:PRESENTS]->(t:Entity {id:$id}) OPTIONAL MATCH (p)-[:PRESENTS]->(o:Entity) WHERE o.id <> $id "
               "RETURN p.name, p.title, p.org, collect(DISTINCT o.name)[0..3]")
@@ -167,6 +173,34 @@ async def entity(sid: str, id: str):
     score = next((r["score"] for r in s.ranking(everything=True) if r["id"] == id), None)
     return JSONResponse({"entity": e, "score": score, "scores": scores, "evidence": evidence, "related": related,
                          "sources": sources, "queries": queries, "calls": s.calls.get(id, [])})
+
+
+@app.get("/api/enrich")
+async def enrich(id: str):
+    """Who is this person? Cached in the graph; otherwise one Bright Data SERP lookup for their LinkedIn."""
+    import brightdata
+    e = engine.ENTITIES.get(id)
+    if not e or e["kind"] not in ("person", "speaker"):
+        return JSONResponse({"error": "not a person"}, status_code=400)
+    rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials", {"id": id})
+    if rows and (rows[0][0] or rows[0][3]):
+        return JSONResponse({"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
+                             "other": json.loads(rows[0][3]) if rows[0][3] else []})
+    q1 = f"\"{e['name']}\" {e.get('org', '')} linkedin"
+    q2 = f"\"{e['name']}\" (site:github.com OR site:x.com OR site:bsky.app OR site:mastodon.social)"
+    r1, r2 = await asyncio.gather(brightdata.serp(q1), brightdata.serp(q2))
+    hit = next((x for x in r1["results"] if "linkedin.com/in/" in x["link"]), None)
+    last = e["name"].split()[-1].lower()
+    socials = [x for x in r2["results"] if last in (x["title"] + x["link"] + x["description"]).lower()][:3]
+    out = {"queries": [{"q": q1, "ms": r1["ms"], "bytes": r1["bytes"]}, {"q": q2, "ms": r2["ms"], "bytes": r2["bytes"]}],
+           "product": "SERP API", "cached": False,
+           "linkedin": hit["link"] if hit else "", "headline": (hit["title"] + " — " + hit["description"])[:300] if hit else "",
+           "other": [{"title": x["title"], "url": x["link"], "snippet": x["description"][:200]} for x in socials]}
+    if hit or socials:
+        await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
+                        {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
+                         "ms": max(r1["ms"], r2["ms"])})
+    return JSONResponse(out)
 
 
 @app.get("/api/calendar.ics")

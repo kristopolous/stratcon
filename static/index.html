@@ -86,7 +86,9 @@ header span{color:var(--dim);font-size:13px}
 #rows{position:relative;flex:1;overflow-y:auto;overflow-x:hidden}
 .row{position:absolute;left:0;right:0;height:var(--rh);padding:0 16px;gap:8px;border-bottom:1px solid #161a21;transition:transform .7s cubic-bezier(.2,.8,.2,1),opacity .5s}
 .row{cursor:pointer}.row:hover{background:#10141a}
-.row .rk{font:600 13px var(--mono);color:var(--faint)}
+.row .rk{font:600 13px var(--mono);color:var(--faint);display:flex;align-items:center;gap:4px}
+.pin{cursor:pointer;color:var(--faint);font-size:11px}.pin:hover{color:var(--gap)}
+.row.pinned{background:rgba(245,180,69,.05)}.row.pinned .pin{color:var(--gap)}
 .row.top .rk{color:var(--text)}
 .ent .n{font-weight:600;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ent .m{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -188,7 +190,7 @@ header span{color:var(--dim);font-size:13px}
 const RH = 66, SHOW = 12;
 document.documentElement.style.setProperty('--rh', RH + 'px');
 const sid = 's' + Math.random().toString(36).slice(2, 9);
-const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0, tfBox = null;
+const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0, tfBox = null; const pins = new Set();
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u || ''; } };
@@ -223,7 +225,7 @@ function chat(html, cls) {
   $('#log').append(d); $('#log').scrollTop = 1e9; return d;
 }
 
-function cols() { return `34px minmax(170px,1.4fr) 62px ${crits.map(() => 'minmax(104px,1fr)').join(' ')}`; }
+function cols() { return `44px minmax(170px,1.4fr) 62px ${crits.map(() => 'minmax(104px,1fr)').join(' ')}`; }
 function renderHead() {
   $('#thead').style.gridTemplateColumns = cols();
   $('#thead').innerHTML = `<div>#</div><div>recommendation</div><div style="text-align:right">score</div>` +
@@ -275,7 +277,8 @@ function render() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; doRen
 function doRender() {
   const box = $('#rows');
   if (crits.length) $('#empty').style.display = 'none';
-  const top = rank.filter(r => r.score > 0 || crits.some(c => cells[r.id + '|' + c.id])).slice(0, SHOW);
+  const pinnedRows = [...pins].map(id => rank.find(r => r.id === id) || {id, score: 0});
+  const top = pinnedRows.concat(rank.filter(r => !pins.has(r.id) && (r.score > 0 || crits.some(c => cells[r.id + '|' + c.id])))).slice(0, Math.max(SHOW, pins.size));
   const keep = new Set(top.map(r => r.id));
   Object.keys(rowEls).forEach(id => { if (!keep.has(id)) { const el = rowEls[id]; el.style.opacity = 0; setTimeout(() => el.remove(), 500); delete rowEls[id]; } });
   top.forEach((r, i) => {
@@ -286,7 +289,8 @@ function doRender() {
     el.dataset.id = r.id;
     el.style.gridTemplateColumns = cols();
     el.style.transform = `translateY(${i * RH}px)`;
-    el.innerHTML = `<div class="rk">${i + 1}</div>
+    el.classList.toggle('pinned', pins.has(r.id));
+    el.innerHTML = `<div class="rk"><span class="pin" data-pin="${esc(r.id)}" title="pin: keep this on the board">${pins.has(r.id) ? '●' : '○'}</span>${i + 1}</div>
       <div class="ent">${e.logo ? `<img class="logo ${e.kind === 'speaker' ? 'person' : ''}" src="${esc(e.logo)}" alt="" loading="lazy">` : ''}<div class="txt"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' || e.kind === 'person' ? 'var(--speaker)' : e.kind === 'talk' ? 'var(--crit)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
       ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · featured speaker' : e.kind === 'person' ? (e.tier ? e.tier + ' · ' : '') + e.org : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
       <div class="score">${(r.score * 100).toFixed(0)}</div>` + crits.map(c => cellHTML(r.id, c)).join('');
@@ -295,6 +299,8 @@ function doRender() {
 }
 
 $('#rows').addEventListener('click', ev => {
+  const pin = ev.target.closest('[data-pin]');
+  if (pin) { const id = pin.dataset.pin; pins.has(id) ? pins.delete(id) : pins.add(id); render(); ev.stopPropagation(); return; }
   const c = ev.target.closest('.cell.evid');
   if (!c) { const row = ev.target.closest('.row'); if (row && row.dataset.id) openEntity(row.dataset.id); return; }
   const [eid, cid] = c.dataset.k.split('|'), x = cells[c.dataset.k], cr = crits.find(k => k.id === cid), e = E[eid];
@@ -304,6 +310,16 @@ $('#rows').addEventListener('click', ev => {
     <div class="sub">source: <a href="${esc(x.evidence.url)}" target="_blank">${esc(x.evidence.url)}</a></div>
     <div class="calls">${(x.calls || []).map(k => `<div>${esc(k.product)} · ${esc(k.target)} · ${(k.ms / 1000).toFixed(1)}s · ${(k.bytes / 1024).toFixed(0)} KB</div>`).join('')}</div>`;
   $('#drawer').classList.add('on');
+  if (e.kind === 'person' || e.kind === 'speaker') {
+    const box = document.createElement('div');
+    box.innerHTML = `<div class="dsec">who is this</div><div class="dl dim">looking them up with Bright Data SERP API…</div>`;
+    $('#dbox').insertBefore(box, $('#dbox').children[2]);
+    const p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+    box.innerHTML = `<div class="dsec">who is this</div>` +
+      (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
+      (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
+      (p.cached ? `<div class="dl dim">from graph memory (FalkorDB)</div>` : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s · ${Math.round((q.bytes || 0) / 1024)} KB</div>`).join('') + `<div class="dl dim">saved to graph</div>`);
+  }
 });
 $('#drawer').addEventListener('click', e => {
   if (e.target.id === 'drawer') e.currentTarget.classList.remove('on');
@@ -323,12 +339,22 @@ async function openEntity(id) {
     ${d.sources.map(src => `<div class="dl"><a href="${esc(src.url)}" target="_blank">${esc(src.url.replace(/^https:\/\//, ''))}</a> <span class="dim">· fetched with Bright Data ${esc(src.product)}${src.ms ? ` · ${(src.ms / 1000).toFixed(1)}s · ${Math.round((src.bytes || 0) / 1024)} KB` : ''}</span></div>`).join('')}
     ${e.url ? `<div class="dl"><a href="${esc(e.url)}" target="_blank">${esc(host2(e.url))}</a> <span class="dim">· website discovered by search, remembered in graph</span></div>` : ''}
     ${d.scores.length ? `<div class="dsec">against your rubric</div>` + d.scores.map(sc => `<div class="dl"><b style="font-family:var(--mono);color:${sc.p >= .6 ? 'var(--yes)' : sc.p == null ? 'var(--faint)' : 'var(--dim)'}">${sc.p == null ? '  · ' : sc.p.toFixed(2)}</b> ${esc(sc.criterion)} <span class="dim">(weight ${sc.weight})</span>${sc.evidence ? `<blockquote>${esc(sc.evidence.snippet)}<br><a href="${esc(sc.evidence.url)}" target="_blank">${esc(host2(sc.evidence.url))}</a> · ${esc(sc.evidence.product)}</blockquote>` : ''}</div>`).join('') : ''}
-    ${d.related.length ? `<div class="dsec">${e.kind === 'sponsor' ? `talks by people from ${esc(e.name.split(',')[0])}` : e.kind === 'speaker' ? 'talks' : 'presenters'}</div>` +
+    ${d.related.length ? `<div class="dsec">${e.kind === 'sponsor' ? `talks by people from ${esc(e.name.split(',')[0])}` : e.kind === 'speaker' || e.kind === 'person' ? 'where to find them' : 'presenters'}</div>` +
       d.related.map(r => r.id ? `<div class="dl link" data-open="${esc(r.id)}"><span class="dim">${esc(r.label)}</span> ${esc(r.name)} <span class="dim">· ${esc(r.when)}${r.room ? ' · ' + esc(r.room) : ''}</span></div>` : `<div class="dl">${esc(r.label)}${r.also && r.also.length ? ` <span class="dim">· also: ${esc(r.also.join('; '))}</span>` : ''}</div>`).join('') : ''}
     ${d.evidence.length ? `<div class="dsec">evidence in graph</div>` + d.evidence.map(x => `<div class="dl"><span class="dim">${esc(x.product)} · ${esc(x.criterion || '')}</span><br>${esc((x.snippet || '').slice(0, 220))} <a href="${esc(x.url)}" target="_blank">${esc(host2(x.url))}</a></div>`).join('') : ''}
     ${d.calls.length ? `<div class="dsec">Bright Data requests for this</div>` + d.calls.map(c => `<div class="dl" style="font:12px var(--mono)"><span style="color:${c.ok ? 'var(--yes)' : '#e5636b'}">${c.ok ? '✓' : '✗'}</span> ${esc(c.product)} <span class="dim">[${esc(c.strategy)}]</span> ${esc(c.target)} <span class="dim">· ${(c.ms / 1000).toFixed(1)}s · ${Math.round(c.bytes / 1024)} KB · for “${esc(c.criterion)}”</span></div>`).join('') : ''}
     <div class="dsec">FalkorDB queries</div>${d.queries.map(q => `<div class="dl"><code style="font:11px var(--mono);color:#9fb0c8;white-space:pre-wrap">${esc(q.cypher)}</code> <span class="dim">${q.ms}ms</span></div>`).join('')}`;
   $('#drawer').classList.add('on');
+  if (e.kind === 'person' || e.kind === 'speaker') {
+    const box = document.createElement('div');
+    box.innerHTML = `<div class="dsec">who is this</div><div class="dl dim">looking them up with Bright Data SERP API…</div>`;
+    $('#dbox').insertBefore(box, $('#dbox').children[2]);
+    const p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+    box.innerHTML = `<div class="dsec">who is this</div>` +
+      (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
+      (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
+      (p.cached ? `<div class="dl dim">from graph memory (FalkorDB)</div>` : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s · ${Math.round((q.bytes || 0) / 1024)} KB</div>`).join('') + `<div class="dl dim">saved to graph</div>`);
+  }
 }
 
 /* ---------- graph ---------- */
@@ -426,6 +452,11 @@ function handle(ev) {
       status(`graph had too few routes — one pass over all ${ev.n} with ${ev.model}`, 1, 'Fallback shortlist');
       trace(s, 's1', `graph routes thin → ${esc(ev.model)} choice over ${ev.n} (${ev.ms}ms): ` + ev.top.map(([n, p]) => `${esc(n)} ${p.toFixed(2)}`).join(' · '));
       break;
+    case 'research':
+      trace(s, 'bd', `Bright Data SERP API (agent research) · ${esc(ev.entity)} · “${esc(ev.question)}” · ${(ev.ms / 1000).toFixed(1)}s<br>` +
+        ev.hits.map(h => `· ${esc(h.title)} <span style="color:var(--faint)">${esc(host(h.url))}</span>`).join('<br>'));
+      status(`${ev.entity}: ${ev.hits.length} results for “${ev.question}”`, 1, 'Bright Data SERP API · researching your question');
+      break;
     case 'fulltext': if (!ev.hits.length) status(`no keyword hits either for “${ev.query}”, asking the decision model to scan everything`, 1, 'FalkorDB full-text');
       else status(`keyword matches: ${ev.hits.join(', ')}`, 1, 'FalkorDB full-text');
       trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
@@ -443,7 +474,9 @@ function handle(ev) {
       if (ev.name === 'call_tool') { inner = a.tool_name; x = a.input || {}; }
       const body = inner === 'add_criterion' ? `"${esc(x.text)}", ${x.weight}` : inner === 'reweight' ? `"${label(x.criterion_id)}", ${crits.find(c => c.id === x.criterion_id)?.weight ?? '?'} → ${x.weight}` :
         inner === 'remove_criterion' ? `"${label(x.criterion_id)}"` : inner === 'set_scope' ? `"${esc(x.scope)}"` : inner === 'set_clock' ? `"${esc(x.iso_datetime)}"` :
-        inner === 'list_tools' ? `"${esc(a.mcp_server)}"` : inner === 'get_tool_info' ? `"${esc(a.mcp_server)}", "${esc(a.tool_name)}"` : '';
+        inner === 'list_tools' ? `"${esc(a.mcp_server)}"` : inner === 'get_tool_info' ? `"${esc(a.mcp_server)}", "${esc(a.tool_name)}"` :
+        inner === 'research' ? `"${esc(x.entity)}", "${esc(x.question)}"` : inner === 'graph_query' ? `<span style="color:#9fb0c8">${esc((x.cypher || '').slice(0, 120))}</span>` :
+        inner === 'current_recommendations' ? '' : '';
       const meta = ev.name === 'list_tools' || ev.name === 'get_tool_info';
       const cls = meta ? 'meta' : inner === 'remove_criterion' ? 'rm' : inner === 'reweight' || inner === 'set_clock' ? 'rw' : '';
       const via = ev.name === 'call_tool' ? `<span class="via">call_tool → ${esc(a.mcp_server)}.</span>` : '';
@@ -507,7 +540,7 @@ function handle(ev) {
     case 'fetch': {
       const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `SERP API: ${ev.target}`) :
         ev.product === 'Web Unlocker' ? `reading ${host(ev.target)}` : `rendering ${host(ev.target)} in browser`;
-      setTimeout(() => { setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
+      if (ev.e && ev.c) setTimeout(() => { setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
       trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(doing + ` (for ${E[ev.e]?.name})`, 1, `Bright Data ${ev.product}`);
       break;
     }
@@ -516,7 +549,8 @@ function handle(ev) {
       else { setCell(ev.e, ev.c, {state: 'gap'}); render(); trace(s, 'bd', `${esc(ev.product || ev.strategy)} ✗ ${ev.error ? esc(ev.error) : 'nothing relevant'} — escalating`); }
       break;
     case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
-    case 'graph': refreshGraph(); if (ev.op !== 'scored') trace(s, 'fk', `${ev.op} (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); else trace(s, 'fk', `wrote ${ev.n} SCORED edges (${ev.ms}ms)`); break;
+    case 'graph': if (ev.op === 'agent_query') status(`agent asked the graph: ${ev.n} rows in ${ev.ms}ms`, 1, 'FalkorDB Cypher (from TrueForge)');
+      refreshGraph(); if (ev.op !== 'scored') trace(s, 'fk', `${ev.op} (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); else trace(s, 'fk', `wrote ${ev.n} SCORED edges (${ev.ms}ms)`); break;
     case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1, 'Redirected'); tfBox = null;
       document.querySelectorAll('.cell.gap, .cell.route, .cell.fetch').forEach(() => {});
       Object.values(cells).forEach(c => { if (['gap', 'route', 'fetch'].includes(c.state)) c.state = 'done'; }); render(); break;
@@ -537,7 +571,7 @@ async function send(text) {
   chat(esc(text), 'u'); $('#q').value = '';
   const mine = ctrl = new AbortController();
   let res;
-  try { res = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text}), signal: mine.signal}); }
+  try { res = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text, pins: [...pins]}), signal: mine.signal}); }
   catch { return; }
   const rd = res.body.getReader(), dec = new TextDecoder(); let buf = '';
   for (;;) {
