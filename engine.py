@@ -11,7 +11,7 @@ from falkordb import FalkorDB
 import brightdata
 import config
 
-graph = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+graph = None
 
 GAP_LO, GAP_HI = 0.25, 0.75
 MAX_GAPS = 4
@@ -44,6 +44,13 @@ def _reconnect():
 
 async def gq(cypher: str, params: dict | None = None, timeout: float = 15):
     t = time.time()
+    if graph is None:
+        for attempt in range(10):
+            try:
+                await asyncio.to_thread(_reconnect)
+                break
+            except Exception:
+                await asyncio.sleep(3)
     try:
         res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
     except Exception as x:
