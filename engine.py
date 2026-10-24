@@ -42,15 +42,15 @@ def _reconnect():
     graph = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
 
 
-async def gq(cypher: str, params: dict | None = None):
+async def gq(cypher: str, params: dict | None = None, timeout: float = 15):
     t = time.time()
     try:
-        res = await asyncio.to_thread(graph.query, cypher, params or {})
+        res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
     except Exception as x:
-        if "pipe" not in str(x).lower() and "connection" not in str(x).lower() and "closed" not in str(x).lower():
+        if not isinstance(x, asyncio.TimeoutError) and not any(k in str(x).lower() for k in ("pipe", "connection", "closed", "timeout")):
             raise
         await asyncio.to_thread(_reconnect)
-        res = await asyncio.to_thread(graph.query, cypher, params or {})
+        res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
     return res.result_set, int((time.time() - t) * 1000)
 
 
@@ -135,6 +135,9 @@ class Session:
         self.ops: list[dict] = []
         self.tf_id: str | None = None
         self.now: datetime | None = None
+        self.gen = 0
+        self.tasks: list[asyncio.Task] = []
+        self.calls: dict[str, list] = {}
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -145,7 +148,7 @@ class Session:
         if self.scope == "sponsors":
             return [e for e in ENTITIES.values() if e["kind"] == "sponsor"]
         if self.scope == "speakers":
-            return [e for e in ENTITIES.values() if e["kind"] == "speaker"]
+            return [e for e in ENTITIES.values() if e["kind"] in ("speaker", "person")]
         if self.scope == "talks":
             return [e for e in ENTITIES.values() if e["kind"] == "talk"]
         return list(ENTITIES.values())
@@ -165,7 +168,7 @@ class Session:
 
 
 AGENT_PROMPT = """You maintain the recommendation rubric for one attendee of GitHub Universe 2026 \
-(54 expo-hall sponsor booths, 157 talks and sessions, and featured speakers). The rubric is a short list of criteria. Each criterion is a \
+(54 expo-hall sponsor booths, 157 talks and sessions, featured speakers, and 175 presenters you could meet). The rubric is a short list of criteria. Each criterion is a \
 yes/no-checkable statement about a sponsor or speaker, e.g. "Helps automatically test web apps". \
 Weight 0.1 to 1.0 says how much it matters; use a negative weight (-1.0 to -0.1) for things to avoid.
 
@@ -179,8 +182,9 @@ ops are any of:
   {"op":"clock","value":"2026-10-28T14:00"}   (when the attendee says what day/time it is at the conference; \
 the conference runs Oct 28-29, 2026)
   {"op":"calendar"}   (when the attendee asks to export, save or add their plan to a calendar)
-Rules: at most 5 criteria in total. "Which talks/sessions" means scope talks; "which booths/sponsors" means \
-scope sponsors; "which speakers" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
+Rules: at most 5 criteria in total. If the attendee corrects or clarifies ("no, I mean...", "not that, ..."), \
+remove the criterion being corrected and add the clarified one; never keep both. "Which talks/sessions" means scope talks; "which booths/sponsors" means \
+scope sponsors; "which speakers" / "who should I meet" / "people" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
 piling on: "matters less" / "more important" means reweight; "forget" / "drop" / "no longer" means remove. \
 If they bring back something from earlier in the conversation, add it back with the same wording as before. Phrase each criterion concretely in 8 words or fewer so it can be checked against a company description."""
 
@@ -209,7 +213,8 @@ TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubr
 add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
 conference, Oct 28-29 2026), export_calendar (when they want their plan in a calendar); call get_rubric if you \
 need criterion ids. Make every edit \
-the attendee's message implies, then reply with one short sentence. Rules: at most 5 criteria. "matters less" / \
+the attendee's message implies, then reply with one short sentence. If the attendee corrects or clarifies \
+("no, I mean..."), remove_criterion the one being corrected and add the clarified one. Rules: at most 5 criteria. "matters less" / \
 "more important" means reweight; "forget" / "drop" / "no longer" means remove. If they bring back something from \
 earlier, add it back with the same wording as before. Phrase each criterion in 8 words or fewer."""
 
@@ -305,6 +310,14 @@ async def agent_trueforge(session: "Session", text: str):
              ms=int((time.time() - t0) * 1000), ops=session.ops, reply=reply)
 
 
+async def gw(events: list, op: str, cy: str, params: dict, **kw):
+    try:
+        _, ms = await gq(cy, params)
+        events.append(ev("graph", op=op, cypher=cy, ms=ms, **kw))
+    except Exception as x:
+        events.append(ev("graph", op=op, cypher=cy, ms=0, error=str(x)[:160], **kw))
+
+
 async def apply_ops(session: Session, ops: list[dict]):
     events = []
     for op in ops:
@@ -315,22 +328,19 @@ async def apply_ops(session: Session, ops: list[dict]):
             session.criteria[cid] = {"id": cid, "text": op["text"].strip(), "weight": w}
             cy = ("MERGE (u:User {id:$sid}) MERGE (c:Criterion {id:$cid}) ON CREATE SET c.text=$text "
                   "MERGE (u)-[r:WANTS]->(c) SET r.weight=$w")
-            _, ms = await gq(cy, {"sid": session.sid, "cid": cid, "text": op["text"], "w": w})
-            events.append(ev("graph", op="add", cypher=cy, ms=ms, crit=cid))
+            await gw(events, "add", cy, {"sid": session.sid, "cid": cid, "text": op["text"], "w": w}, crit=cid)
         elif kind == "remove" and op.get("id") in session.criteria:
             cid = op["id"]
             session.criteria.pop(cid)
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) DELETE r"
-            _, ms = await gq(cy, {"sid": session.sid, "cid": cid})
-            events.append(ev("graph", op="remove", cypher=cy, ms=ms, crit=cid))
+            await gw(events, "remove", cy, {"sid": session.sid, "cid": cid}, crit=cid)
         elif kind == "reweight" and op.get("id") in session.criteria:
             cid = op["id"]
             w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
             events.append(ev("reweight", crit=cid, before=session.criteria[cid]["weight"], after=w))
             session.criteria[cid]["weight"] = w
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) SET r.weight=$w"
-            _, ms = await gq(cy, {"sid": session.sid, "cid": cid, "w": w})
-            events.append(ev("graph", op="reweight", cypher=cy, ms=ms, crit=cid))
+            await gw(events, "reweight", cy, {"sid": session.sid, "cid": cid, "w": w}, crit=cid)
         elif kind == "scope" and op.get("value") in ("all", "sponsors", "speakers", "talks"):
             session.scope = op["value"]
         elif kind == "clock" and op.get("value"):
@@ -370,23 +380,45 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
             yield e
         return
     ents = session.entities()
+    allowed = {e["id"] for e in ents}
     rel: dict[str, float] = {e["id"]: 0.0 for e in ents}
     keep: set[str] = set()
-    opts = {e["id"]: f"{e['name']}: {e['description'][:160]}" for e in ents}
+    from ingest import TOPICS as _T, ROLES as _R
+    TOPICS = {**_T, **_R}
     for cid in crits:
         text = session.criteria[cid]["text"]
-        yield ev("retrieval", crit=cid, model=config.ROUTER_MODEL, phase="start", n=len(opts))
-        a, ms = await systemone(config.ROUTER_MODEL, "GitHub Universe 2026 sponsor booths, talks and featured speakers.",
-                                {"pick": {"type": "choice", "instructions": f"Which one best satisfies: {text}?",
-                                          "criteria": opts}})
-        probs = sorted(a["pick"]["probabilities"].items(), key=lambda x: -x[1])
-        for i, pr in probs:
-            rel[i] += pr
-        keep |= {i for i, _ in probs[:RETRIEVE_PER_CRIT]}
-        for kind in ("sponsor", "talk", "speaker"):
-            keep |= {i for i, _ in [x for x in probs if ENTITIES[x[0]]["kind"] == kind][:2]}
-        yield ev("retrieval", crit=cid, model=config.ROUTER_MODEL, phase="done", ms=ms, n=len(opts),
-                 top=[[ENTITIES[i]["name"], round(pr, 3)] for i, pr in probs[:6]])
+        a, ms = await systemone(config.ROUTER_MODEL, "Map an attendee's criterion onto conference topics.",
+                                {"t": {"type": "choice", "instructions": f"Which topic does this criterion belong to: {text}?",
+                                       "criteria": TOPICS}})
+        probs = sorted(a["t"]["probabilities"].items(), key=lambda x: -x[1])
+        topics = [{"t": t, "p": round(p, 3)} for t, p in probs[:3] if p >= 0.1 or t == probs[0][0]]
+        cy = ("MATCH (c:Criterion {id:$cid}) OPTIONAL MATCH (c)-[m:MAPS_TO]->() DELETE m WITH DISTINCT c "
+              "UNWIND $topics AS x MATCH (t:Topic {id:x.t}) CREATE (c)-[:MAPS_TO {p:x.p}]->(t)")
+        _, gms = await gq(cy, {"cid": cid, "topics": topics})
+        yield ev("topics", crit=cid, model=config.ROUTER_MODEL, ms=ms, topics=[[TOPICS[x["t"]], x["p"]] for x in topics],
+                 cypher=cy, gms=gms)
+        cy = ("MATCH (c:Criterion {id:$cid}), (e:Entity) "
+              "WITH c, e, shortestPath((c)-[:MAPS_TO|COVERS|PRESENTED_BY|WORKS_AT|EMPLOYS|PRESENTS*..5]->(e)) AS p "
+              "WHERE p IS NOT NULL "
+              "RETURN e.id, length(p), reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.p, 0.6)) AS w "
+              "ORDER BY length(p), w DESC LIMIT 60")
+        rows, ms = await gq(cy, {"cid": cid})
+        rows = [r for r in rows if r[0] in allowed]
+        for eid, hops, w in rows:
+            rel[eid] += float(w) / hops
+        direct = [r for r in rows if r[1] <= 3][:RETRIEVE_PER_CRIT + 3]
+        hops2 = [r for r in rows if r[1] > 3][:3]
+        keep |= {r[0] for r in direct} | {r[0] for r in hops2}
+        yield ev("graph_search", crit=cid, cypher=cy, ms=ms, hits=len(rows),
+                 direct=[ENTITIES[r[0]]["name"] for r in direct], multihop=[ENTITIES[r[0]]["name"] for r in hops2])
+        q = " | ".join(keywords(text)) or text
+        cy = "CALL db.idx.fulltext.queryNodes('Entity', $q) YIELD node, score RETURN node.id, score ORDER BY score DESC LIMIT 5"
+        rows, ms = await gq(cy, {"q": q.replace("-", " ")})
+        rows = [r for r in rows if r[0] in allowed]
+        for eid, sc in rows:
+            rel[eid] += 0.2 * float(sc)
+        keep |= {r[0] for r in rows[:3]}
+        yield ev("fulltext", crit=cid, cypher=cy, query=q, ms=ms, hits=[ENTITIES[r[0]]["name"] for r in rows[:3]])
     keep |= {r["id"] for r in session.ranking()[:TOP_FOR_GAPS] if r["score"] > 0}
     ents = sorted((e for e in ents if e["id"] in keep), key=lambda e: -rel[e["id"]])
     yield ev("candidates", total=len(rel), kept=len(ents), names=[e["name"] for e in ents])
@@ -467,7 +499,7 @@ async def route(session: Session, gaps: list[dict]):
         e = ENTITIES[g["e"]]
         tried = session.tried.get((g["e"], g["c"]), [])
         avail = [s for s in STRATEGIES if s not in [t["strategy"] for t in tried]]
-        if e["kind"] == "speaker":
+        if e["kind"] in ("speaker", "person"):
             avail = [s for s in avail if s in ("web_search", "people_search")]
         elif e["kind"] == "talk":
             avail = [s for s in avail if s == "web_search"]
@@ -551,7 +583,9 @@ async def execute(session: Session, g: dict, out: asyncio.Queue):
                      ms=sum(h["ms"] for h in hits), bytes=last["bytes"], snippet=snippet, ok=ok,
                      calls=[{"product": h["product"], "target": h["target"], "ms": h["ms"], "bytes": h["bytes"]}
                             for h in hits]))
-    return ok, snippet, url, last["product"]
+    calls = [{"product": h["product"], "strategy": s, "target": h["target"], "ms": h["ms"], "bytes": h["bytes"]} for h in hits]
+    session.calls.setdefault(e["id"], []).extend([{**c, "ok": ok, "criterion": crit} for c in calls])
+    return ok, snippet, url, last["product"], calls
 
 
 def serp_evidence(results: list[dict], e: dict, kws: list[str]) -> tuple[str, str]:
@@ -571,7 +605,8 @@ def serp_evidence(results: list[dict], e: dict, kws: list[str]) -> tuple[str, st
     return text[:700], about[0]["link"]
 
 
-async def rescore(session: Session, g: dict, snippet: str, url: str, product: str, out: asyncio.Queue):
+async def rescore(session: Session, g: dict, snippet: str, url: str, product: str, out: asyncio.Queue,
+                  calls: list | None = None):
     e = ENTITIES[g["e"]]
     crit = session.criteria[g["c"]]
     state = f"{e['name']} ({e['tier']}): {e['description']}\n\nEvidence gathered from {url}:\n{snippet}"
@@ -587,9 +622,10 @@ async def rescore(session: Session, g: dict, snippet: str, url: str, product: st
                                       "src": "evidence", "evidence": evidence, "ms": ms}]))
     await out.put(ev("rank", rows=session.ranking()))
     cy = ("MATCH (e:Entity {id:$e}), (c:Criterion {id:$c}) MERGE (e)-[s:SCORED]->(c) SET s.p=$p, s.ev=1 "
-          "CREATE (x:Evidence {url:$u, product:$prod, snippet:$snip, at:timestamp()}) "
+          "CREATE (x:Evidence {url:$u, product:$prod, snippet:$snip, calls:$calls, at:timestamp()}) "
           "CREATE (x)-[:ABOUT]->(e) CREATE (x)-[:INFORMS]->(c)")
-    _, gms = await gq(cy, {"e": g["e"], "c": g["c"], "p": p, "u": url, "prod": product, "snip": snippet})
+    _, gms = await gq(cy, {"e": g["e"], "c": g["c"], "p": p, "u": url, "prod": product, "snip": snippet,
+                           "calls": json.dumps(calls or [])})
     await out.put(ev("graph", op="evidence", cypher=cy, ms=gms, e=g["e"], c=g["c"]))
 
 
@@ -602,15 +638,43 @@ async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
             await out.put(ev("route", e=g["e"], c=g["c"], probs=g["probs"], chosen=g["strategy"], ms=ms,
                              model=config.ROUTER_MODEL, attempt=attempt + 1))
         try:
-            ok, snippet, url, product = await execute(session, g, out)
+            ok, snippet, url, product, calls = await execute(session, g, out)
         except Exception as x:
             await out.put(ev("evidence", e=g["e"], c=g["c"], strategy=g["strategy"], ok=False, error=str(x)[:200]))
             session.tried.setdefault((g["e"], g["c"]), []).append({"strategy": g["strategy"], "outcome": "error"})
             continue
         if ok:
-            await rescore(session, g, snippet, url, product, out)
+            await rescore(session, g, snippet, url, product, out, calls)
             return
     await out.put(ev("unresolved", e=g["e"], c=g["c"]))
+
+
+WHY_PATH = ("MATCH (u:User {id:$sid}), (e:Entity {id:$id}) "
+            "WITH u, e, shortestPath((u)-[:WANTS|MAPS_TO|COVERS|PRESENTED_BY|WORKS_AT|EMPLOYS|PRESENTS*..7]->(e)) AS p "
+            "WHERE p IS NOT NULL "
+            "RETURN [n IN nodes(p) | [labels(n)[0], coalesce(n.id, ''), coalesce(n.name, n.text, '')]], "
+            "[r IN relationships(p) | type(r)]")
+
+
+async def explain(session: Session, n: int = 3):
+    """Each top recommendation's reason: the shortest path from the attendee to it, plus the evidence on that edge."""
+    items, total = [], 0
+    for r in [r for r in session.ranking() if r["score"] > 0][:n]:
+        e = ENTITIES[r["id"]]
+        rows, ms = await gq(WHY_PATH, {"sid": session.sid, "id": e["id"]})
+        total += ms
+        if not rows:
+            continue
+        nodes, rels = rows[0]
+        best = None
+        for cid, c in session.criteria.items():
+            cell = session.cells.get((e["id"], cid))
+            if cell and c["weight"] > 0 and (best is None or c["weight"] * cell["p"] > best[0]):
+                best = (c["weight"] * cell["p"], c["text"], cell)
+        items.append({"id": e["id"], "nodes": nodes, "rels": rels,
+                      "p": round(best[2]["p"], 2) if best else None, "criterion": best[1] if best else "",
+                      "evidence": (best[2].get("evidence") or {}) if best else {}})
+    return items, [WHY_PATH], total
 
 
 async def turn(session: Session, text: str):
@@ -665,7 +729,7 @@ async def turn(session: Session, text: str):
         e = ENTITIES[row["id"]]
         if e["kind"] == "talk":
             continue
-        thin = e["kind"] == "speaker" or len(e["description"]) < 90
+        thin = e["kind"] in ("speaker", "person") or len(e["description"]) < 90
         for cid, c in session.criteria.items():
             cell = session.cells.get((row["id"], cid))
             if not cell or c["weight"] <= 0 or cell.get("evidence") or cell["src"] == "evidence" \
@@ -688,6 +752,7 @@ async def turn(session: Session, text: str):
                          model=config.ROUTER_MODEL, attempt=1)
         q: asyncio.Queue = asyncio.Queue()
         tasks = [asyncio.create_task(fill_gap(session, g, q)) for g in gaps if g["strategy"]]
+        session.tasks.extend(tasks)
         done = asyncio.gather(*tasks)
         while not done.done() or not q.empty():
             try:
@@ -695,4 +760,7 @@ async def turn(session: Session, text: str):
             except asyncio.TimeoutError:
                 pass
         await done
+    items, cyphers, ms = await explain(session)
+    if items:
+        yield ev("why", items=items, cypher=cyphers, ms=ms)
     yield ev("done", ms=int((time.time() - t0) * 1000))
