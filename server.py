@@ -46,13 +46,42 @@ async def entities():
 async def turn(req: Request):
     body = await req.json()
     s = session(body["sid"])
+    if getattr(s, "current", None) and not s.current.done():
+        s.current.cancel()
+        for t in s.tasks:
+            t.cancel()
+        s.tasks = []
+        if s.tf_id and engine.config.TRUEFORGE_URL:
+            try:
+                await engine.tf_client().sessions.cancel(session_id=s.tf_id)
+            except Exception:
+                pass
+        aborted = True
+    else:
+        aborted = False
+    q: asyncio.Queue = asyncio.Queue()
+
+    async def produce():
+        try:
+            if aborted:
+                await q.put(engine.ev("aborted", text="Previous turn stopped; re-planning with what you just said."))
+            async for e in engine.turn(s, body["text"]):
+                await q.put(e)
+        except asyncio.CancelledError:
+            pass
+        except Exception as x:
+            await q.put(engine.ev("error", text=str(x)[:300]))
+        finally:
+            await q.put(None)
+
+    s.current = asyncio.create_task(produce())
 
     async def stream():
-        try:
-            async for e in engine.turn(s, body["text"]):
-                yield f"data: {json.dumps(e)}\n\n"
-        except Exception as x:
-            yield f"data: {json.dumps(engine.ev('error', text=str(x)[:300]))}\n\n"
+        while True:
+            e = await q.get()
+            if e is None:
+                break
+            yield f"data: {json.dumps(e)}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -62,23 +91,39 @@ async def graph(sid: str):
     s = session(sid)
     top = [r["id"] for r in s.ranking()[:10] if r["score"] > 0]
     cy = ("MATCH (u:User {id:$sid})-[w:WANTS]->(c:Criterion) "
-          "OPTIONAL MATCH (e:Entity)-[sc:SCORED]->(c) WHERE e.id IN $top AND sc.p > 0.5 "
-          "OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) WHERE (x)-[:INFORMS]->(c) "
-          "RETURN c.id, c.text, w.weight, e.id, e.name, e.kind, sc.p, id(x), x.product, x.url")
+          "OPTIONAL MATCH (c)-[m:MAPS_TO]->(t:Topic) "
+          "OPTIONAL MATCH (t)-[v:COVERS]->(e:Entity) WHERE e.id IN $top "
+          "RETURN c.id, c.text, w.weight, t.id, t.name, m.p, e.id, e.name, e.kind")
     rows, ms = await engine.gq(cy, {"sid": sid, "top": top})
+    cy2 = ("MATCH (a:Entity)-[:PRESENTED_BY|EMPLOYS]->(p:Person)-[r:WORKS_AT|PRESENTS]->(b:Entity) "
+           "WHERE a.id IN $top AND b.id IN $top RETURN a.id, p.name, b.id, type(r)")
+    rows2, ms2 = await engine.gq(cy2, {"top": top})
+    cy3 = ("MATCH (x:Evidence)-[:ABOUT]->(e:Entity) WHERE e.id IN $top RETURN id(x), x.product, x.url, e.id")
+    rows3, ms3 = await engine.gq(cy3, {"top": top})
     nodes, links = {"you": {"id": "you", "label": "you", "kind": "user"}}, []
-    for cid, ctext, w, eid, ename, ekind, p, xid, prod, url in rows:
+    for cid, ctext, w, tid, tname, mp, eid, ename, ekind in rows:
         nodes[cid] = {"id": cid, "label": ctext, "kind": "criterion", "weight": w}
-        links.append({"source": "you", "target": cid, "kind": "wants", "w": w})
+        links.append({"source": "you", "target": cid, "kind": "wants"})
+        if tid:
+            nodes["t:" + tid] = {"id": "t:" + tid, "label": tname.split(",")[0], "kind": "topic"}
+            links.append({"source": cid, "target": "t:" + tid, "kind": "maps", "p": mp})
         if eid:
             nodes[eid] = {"id": eid, "label": ename, "kind": ekind}
-            links.append({"source": cid, "target": eid, "kind": "scored", "p": p})
-        if xid is not None:
-            xk = f"x{xid}"
-            nodes[xk] = {"id": xk, "label": prod, "kind": "evidence", "url": url}
-            links.append({"source": eid, "target": xk, "kind": "evidence"})
+            links.append({"source": "t:" + tid, "target": eid, "kind": "covers"})
+    for a, pname, b, rtype in rows2:
+        pid = "p:" + pname
+        nodes[pid] = {"id": pid, "label": pname, "kind": "person"}
+        for eid in (a, b):
+            e = engine.ENTITIES.get(eid, {})
+            nodes.setdefault(eid, {"id": eid, "label": e.get("name", eid), "kind": e.get("kind", "")})
+        links += [{"source": a, "target": pid, "kind": "person"}, {"source": pid, "target": b, "kind": "person"}]
+    for xid, prod, url, eid in rows3:
+        if eid in nodes:
+            nodes[f"x{xid}"] = {"id": f"x{xid}", "label": prod, "kind": "evidence", "url": url}
+            links.append({"source": eid, "target": f"x{xid}", "kind": "evidence"})
     uniq = {(l["source"], l["target"]): l for l in links}
-    return JSONResponse({"nodes": list(nodes.values()), "links": list(uniq.values()), "cypher": cy, "ms": ms})
+    return JSONResponse({"nodes": list(nodes.values()), "links": list(uniq.values()),
+                         "cypher": cy, "ms": ms + ms2 + ms3})
 
 
 @app.get("/api/entity")
@@ -88,14 +133,15 @@ async def entity(sid: str, id: str):
     if not e:
         return JSONResponse({"error": "not found"}, status_code=404)
     queries = []
-    cy = "MATCH (e:Entity {id:$id})-[:LISTED_ON]->(src:Source) RETURN src.url, src.product"
+    cy = "MATCH (e:Entity {id:$id})-[:LISTED_ON]->(src:Source) RETURN src.url, src.product, src.ms, src.bytes"
     rows, ms = await engine.gq(cy, {"id": id})
-    sources = [{"url": u, "product": p} for u, p in rows]
+    sources = [{"url": u, "product": p, "ms": m, "bytes": b} for u, p, m, b in rows]
     queries.append({"cypher": cy, "ms": ms})
     cy = ("MATCH (e:Entity {id:$id}) OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) OPTIONAL MATCH (x)-[:INFORMS]->(c:Criterion) "
-          "RETURN x.url, x.product, x.snippet, c.text")
+          "RETURN x.url, x.product, x.snippet, c.text, x.calls")
     rows, ms = await engine.gq(cy, {"id": id})
-    evidence = [{"url": u, "product": p, "snippet": sn, "criterion": ct} for u, p, sn, ct in rows if u]
+    evidence = [{"url": u, "product": p, "snippet": sn, "criterion": ct, "calls": json.loads(cl) if cl else []}
+                for u, p, sn, ct, cl in rows if u]
     queries.append({"cypher": cy, "ms": ms})
     related = []
     if e["kind"] == "sponsor":
@@ -104,7 +150,7 @@ async def entity(sid: str, id: str):
         rows, ms = await engine.gq(cy, {"org": e["name"].split(",")[0]})
         related = [{"label": f"{pn} ({pt}) presents", "id": ti, "name": tn, "when": tw, "room": tr} for pn, pt, ti, tn, tw, tr in rows]
         queries.append({"cypher": cy, "ms": ms})
-    elif e["kind"] == "speaker":
+    elif e["kind"] in ("speaker", "person"):
         cy = "MATCH (e:Entity {id:$id})-[:PRESENTS]->(t:Entity) RETURN t.id, t.name, t.when, t.room"
         rows, ms = await engine.gq(cy, {"id": id})
         related = [{"label": "presents", "id": ti, "name": tn, "when": tw, "room": tr} for ti, tn, tw, tr in rows]
@@ -120,7 +166,7 @@ async def entity(sid: str, id: str):
               for cid, c in s.criteria.items()]
     score = next((r["score"] for r in s.ranking(everything=True) if r["id"] == id), None)
     return JSONResponse({"entity": e, "score": score, "scores": scores, "evidence": evidence, "related": related,
-                         "sources": sources, "queries": queries})
+                         "sources": sources, "queries": queries, "calls": s.calls.get(id, [])})
 
 
 @app.get("/api/calendar.ics")
