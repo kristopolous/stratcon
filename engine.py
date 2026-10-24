@@ -11,7 +11,7 @@ from falkordb import FalkorDB
 import brightdata
 import config
 
-graph = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+graph = None
 
 GAP_LO, GAP_HI = 0.25, 0.75
 MAX_GAPS = 4
@@ -44,6 +44,13 @@ def _reconnect():
 
 async def gq(cypher: str, params: dict | None = None, timeout: float = 15):
     t = time.time()
+    if graph is None:
+        for attempt in range(10):
+            try:
+                await asyncio.to_thread(_reconnect)
+                break
+            except Exception:
+                await asyncio.sleep(3)
     try:
         res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
     except Exception as x:
@@ -103,13 +110,80 @@ async def load_entities():
                        "when": w or "", "room": r or "", "logo": lg or "", "speakers": sp or ""}
 
 
-async def systemone(model: str, state: str, questions: dict) -> tuple[dict, int]:
+# Mirrors storyclass.py: every request declares num_ctx (top level, next to keep_alive), stays inside a
+# per-model character budget (~3.5 chars/token, question scaffold included) and the 64 KiB payload cap,
+# retries 429/5xx with backoff, and on "too large" splits the question batch or halves the state.
+MODEL_NUM_CTX = {"tev1": 2048, "clef-flash": 8192, "nimble": 8192, "nimble-v3": 8192, "clef": 16384, "jev": 16384,
+                 "systemone": 16384}
+MODEL_CHAR_LIMITS = {"tev1": 3500, "clef-flash": 15000, "nimble": 12000, "nimble-v3": 12000, "clef": 20000,
+                     "jev": 20000, "systemone": 20000}
+DEFAULT_NUM_CTX = 8192
+DEFAULT_CHARS = 12000
+MAX_PAYLOAD = 60_000
+MAX_QUESTIONS = 64
+
+
+def _base(model: str) -> str:
+    return model.split(":")[0]
+
+
+def payload_fits(model: str, state: str, questions: dict) -> bool:
+    q = json.dumps(questions)
+    chars = len(state) + len(q)
+    ctx = MODEL_NUM_CTX.get(_base(model), DEFAULT_NUM_CTX)
+    return (len(questions) <= MAX_QUESTIONS and len((state + q).encode()) + 300 < MAX_PAYLOAD
+            and chars <= MODEL_CHAR_LIMITS.get(_base(model), DEFAULT_CHARS) and chars / 3.5 < ctx * 0.9)
+
+
+def _too_large(msg: str) -> bool:
+    m = msg.lower()
+    return "too large" in m or "exceed" in m or "413" in m or "tokens) is too" in m or "batch size" in m
+
+
+async def _post(model: str, state: str, questions: dict) -> dict:
+    body = {"model": model, "state": state, "questions": questions, "keep_alive": "15m",
+            "num_ctx": MODEL_NUM_CTX.get(_base(model), DEFAULT_NUM_CTX)}
+    last = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=180) as c:
+                r = await c.post(config.SYSTEMONE_URL, json=body)
+        except (httpx.TransportError, httpx.TimeoutException) as x:
+            last = f"{type(x).__name__}: {x}"
+            await asyncio.sleep(2 * attempt)
+            continue
+        if r.status_code == 200:
+            return r.json()["answers"]
+        last = f"systemone {model} HTTP {r.status_code}: {r.text[:200]}"
+        if r.status_code == 413 or _too_large(r.text):
+            raise OverflowError(last)
+        if r.status_code == 429 or r.status_code >= 500:
+            await asyncio.sleep(2 * attempt)
+            continue
+        raise RuntimeError(last)
+    raise RuntimeError(last)
+
+
+async def systemone(model: str, state: str, questions: dict, _depth: int = 0) -> tuple[dict, int]:
     t = time.time()
-    async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(config.SYSTEMONE_URL, json={"model": model, "state": state, "questions": questions})
-        if r.status_code != 200:
-            raise RuntimeError(f"systemone {r.status_code}: {r.text[:300]}")
-        return r.json()["answers"], int((time.time() - t) * 1000)
+    try:
+        if not payload_fits(model, state, questions):
+            raise OverflowError("over budget before sending")
+        answers = await _post(model, state, questions)
+    except OverflowError:
+        if _depth >= 4:
+            raise
+        if len(questions) > 1:
+            keys = list(questions)
+            half = len(keys) // 2
+            a1, _ = await systemone(model, state, {k: questions[k] for k in keys[:half]}, _depth + 1)
+            a2, _ = await systemone(model, state, {k: questions[k] for k in keys[half:]}, _depth + 1)
+            answers = {**a1, **a2}
+        elif len(state) > 800:
+            answers, _ = await systemone(model, state[:len(state) // 2] + "\n[... truncated ...]", questions, _depth + 1)
+        else:
+            raise
+    return answers, int((time.time() - t) * 1000)
 
 
 async def warmup():
@@ -138,6 +212,7 @@ class Session:
         self.gen = 0
         self.tasks: list[asyncio.Task] = []
         self.calls: dict[str, list] = {}
+        self.pins: list[str] = []
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -182,8 +257,7 @@ ops are any of:
   {"op":"clock","value":"2026-10-28T14:00"}   (when the attendee says what day/time it is at the conference; \
 the conference runs Oct 28-29, 2026)
   {"op":"calendar"}   (when the attendee asks to export, save or add their plan to a calendar)
-Rules: at most 5 criteria in total. If the attendee corrects or clarifies ("no, I mean...", "not that, ..."), \
-remove the criterion being corrected and add the clarified one; never keep both. "Which talks/sessions" means scope talks; "which booths/sponsors" means \
+Rules: at most 5 criteria in total. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). "Which talks/sessions" means scope talks; "which booths/sponsors" means \
 scope sponsors; "which speakers" / "who should I meet" / "people" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
 piling on: "matters less" / "more important" means reweight; "forget" / "drop" / "no longer" means remove. \
 If they bring back something from earlier in the conversation, add it back with the same wording as before. Phrase each criterion concretely in 8 words or fewer so it can be checked against a company description."""
@@ -209,12 +283,14 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
     return out, int((time.time() - t) * 1000)
 
 
-TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubric only through the stratcon tools: \
+TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """If the attendee ASKS A QUESTION about the recommendations (e.g. "what positions are they hiring for?", "who \
+works there?"), do NOT edit the rubric: call current_recommendations, then research (live web via Bright Data) \
+and/or graph_query (read-only FalkorDB Cypher), and answer in 2-3 sentences naming sources. \
+Edit the rubric only through the stratcon tools: \
 add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
 conference, Oct 28-29 2026), export_calendar (when they want their plan in a calendar); call get_rubric if you \
 need criterion ids. Make every edit \
-the attendee's message implies, then reply with one short sentence. If the attendee corrects or clarifies \
-("no, I mean..."), remove_criterion the one being corrected and add the clarified one. Rules: at most 5 criteria. "matters less" / \
+the attendee's message implies, then reply with one short sentence. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). Rules: at most 5 criteria. "matters less" / \
 "more important" means reweight; "forget" / "drop" / "no longer" means remove. If they bring back something from \
 earlier, add it back with the same wording as before. Phrase each criterion in 8 words or fewer."""
 
@@ -262,7 +338,9 @@ async def agent_trueforge(session: "Session", text: str):
         res = c.sessions.create_turn_stream(
             session_id=session.tf_id,
             input=[t.UserMessage(type="user.message",
-                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\nAttendee says: {text}")])
+                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
+                                         f"Pinned by attendee: {json.dumps([ENTITIES[p]['name'] for p in session.pins])}\n"
+                                         f"Attendee says: {text}")])
         if inspect.isawaitable(res):
             res = await res
         async for e in res:
@@ -310,6 +388,19 @@ async def agent_trueforge(session: "Session", text: str):
              ms=int((time.time() - t0) * 1000), ops=session.ops, reply=reply)
 
 
+def resolve_crit(session: "Session", ref) -> str | None:
+    """Accept a criterion id or its text; None if it doesn't name a current criterion."""
+    if not ref or not isinstance(ref, str):
+        return None
+    if ref in session.criteria:
+        return ref
+    want = ref.strip().lower()
+    for cid, c in session.criteria.items():
+        if c["text"].strip().lower() == want or slug(ref) == cid:
+            return cid
+    return None
+
+
 async def gw(events: list, op: str, cy: str, params: dict, **kw):
     try:
         _, ms = await gq(cy, params)
@@ -329,13 +420,13 @@ async def apply_ops(session: Session, ops: list[dict]):
             cy = ("MERGE (u:User {id:$sid}) MERGE (c:Criterion {id:$cid}) ON CREATE SET c.text=$text "
                   "MERGE (u)-[r:WANTS]->(c) SET r.weight=$w")
             await gw(events, "add", cy, {"sid": session.sid, "cid": cid, "text": op["text"], "w": w}, crit=cid)
-        elif kind == "remove" and op.get("id") in session.criteria:
-            cid = op["id"]
+        elif kind == "remove" and resolve_crit(session, op.get("id")):
+            cid = resolve_crit(session, op.get("id"))
             session.criteria.pop(cid)
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) DELETE r"
             await gw(events, "remove", cy, {"sid": session.sid, "cid": cid}, crit=cid)
-        elif kind == "reweight" and op.get("id") in session.criteria:
-            cid = op["id"]
+        elif kind == "reweight" and resolve_crit(session, op.get("id")):
+            cid = resolve_crit(session, op.get("id"))
             w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
             events.append(ev("reweight", crit=cid, before=session.criteria[cid]["weight"], after=w))
             session.criteria[cid]["weight"] = w
@@ -419,6 +510,27 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
             rel[eid] += 0.2 * float(sc)
         keep |= {r[0] for r in rows[:3]}
         yield ev("fulltext", crit=cid, cypher=cy, query=q, ms=ms, hits=[ENTITIES[r[0]]["name"] for r in rows[:3]])
+        if len(keep) < 5:
+            fstate = "GitHub Universe 2026 sponsor booths, talks and people."
+            finstr = f"Which one best satisfies: {text}?"
+            pool = sorted(ents, key=lambda e: e["kind"] == "talk")
+            opts = {}
+            for e in pool:
+                trial = {**opts, e["id"]: f"{e['name']} ({e['kind']}{', ' + e['org'] if e.get('org') else ''})"}
+                if not payload_fits(config.ROUTER_MODEL, fstate + " " * 200,
+                                    {"pick": {"type": "choice", "instructions": finstr, "criteria": trial}}):
+                    break
+                opts = trial
+            a, ms = await systemone(config.ROUTER_MODEL, fstate,
+                                    {"pick": {"type": "choice", "instructions": finstr, "criteria": opts}})
+            probs = sorted(a["pick"]["probabilities"].items(), key=lambda x: -x[1])
+            for i, pr in probs:
+                rel[i] += pr
+            keep |= {i for i, _ in probs[:RETRIEVE_PER_CRIT]}
+            for kind in ("sponsor", "talk", "speaker", "person"):
+                keep |= {i for i, _ in [x for x in probs if ENTITIES[x[0]]["kind"] == kind][:2]}
+            yield ev("fallback", crit=cid, model=config.ROUTER_MODEL, ms=ms, n=len(opts),
+                     top=[[ENTITIES[i]["name"], round(pr, 3)] for i, pr in probs[:6]])
     keep |= {r["id"] for r in session.ranking()[:TOP_FOR_GAPS] if r["score"] > 0}
     ents = sorted((e for e in ents if e["id"] in keep), key=lambda e: -rel[e["id"]])
     yield ev("candidates", total=len(rel), kept=len(ents), names=[e["name"] for e in ents])
