@@ -20,8 +20,23 @@ body{background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,sans-
 header{grid-column:1/4;display:flex;align-items:center;gap:16px;padding:0 18px;border-bottom:1px solid var(--line)}
 header b{font-size:16px;letter-spacing:.02em}
 header span{color:var(--dim);font-size:13px}
-#histbtn{background:none;border:1px solid #2a303b;color:var(--dim);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer;margin-right:8px}
-#histbtn:hover{color:var(--text);border-color:var(--crit)}
+#menu{background:none;border:none;color:var(--dim);font-size:18px;cursor:pointer;padding:2px 6px;margin-right:-6px}
+#menu:hover{color:var(--text)}
+#side{position:fixed;top:0;left:0;bottom:0;width:340px;max-width:88vw;background:var(--panel);border-right:1px solid var(--line);z-index:20;transform:translateX(-102%);transition:transform .25s ease;display:flex;flex-direction:column;padding:14px;gap:10px}
+#side.on{transform:none}
+#sidebg{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:19;display:none}
+#sidebg.on{display:block}
+.sidehead{display:flex;justify-content:space-between;align-items:center;font-size:15px}
+#sideclose{background:none;border:none;color:var(--dim);cursor:pointer;font-size:15px}
+#newsess{background:#151a22;border:1px solid var(--line);color:var(--text);padding:9px;border-radius:8px;cursor:pointer;font:13px Inter;text-align:left}
+#newsess:hover{border-color:var(--crit)}
+.sidesub{font-size:11.5px;color:var(--faint)}
+#sesslist{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+.sess{padding:9px 10px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+.sess:hover{background:#151a22;border-color:var(--line)}
+.sess.cur{border-color:var(--crit)}
+.sess .t{font-size:13px;color:var(--text)}
+.sess .m{font-size:11.5px;color:var(--dim);margin-top:2px}
 #calbtn{background:#152019;border:1px solid #2f6b52;color:var(--yes);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer}
 #calbtn:disabled{opacity:.35;cursor:default}
 #calbtn:not(:disabled):hover{border-color:var(--yes)}
@@ -160,7 +175,7 @@ header span{color:var(--dim);font-size:13px}
 </head>
 <body>
 <div class="app">
-  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span><button id="histbtn" title="Resume a previous session from the graph">History</button><button id="calbtn" disabled title="TrueForge agent calls the export_calendar MCP tool">Export plan to calendar (.ics)</button></header>
+  <header><button id="menu" title="Sessions">☰</button><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span><button id="calbtn" disabled title="TrueForge agent calls the export_calendar MCP tool">Export plan to calendar (.ics)</button></header>
 
   <section class="chat">
     <div id="log"></div>
@@ -190,6 +205,14 @@ header span{color:var(--dim);font-size:13px}
   <div id="status">ready</div>
 </div>
 <div id="drawer"><div class="box" id="dbox"></div></div>
+<div id="sidebg"></div>
+<aside id="side">
+  <div class="sidehead"><b>Sessions</b><button id="sideclose">✕</button></div>
+  <button id="newsess">+ New session</button>
+  <div class="sidesub">Stored in FalkorDB. Reopening one rebuilds it from the graph — no model calls.</div>
+  <div id="sesslist"></div>
+  <div id="sessq" class="sidesub"></div>
+</aside>
 
 <script>
 const RH = 66, SHOW = 12;
@@ -321,7 +344,6 @@ $('#drawer').addEventListener('click', e => {
   if (e.target.id === 'drawer') e.currentTarget.classList.remove('on');
   const r = e.target.closest('[data-open]'); if (r) openEntity(r.dataset.open);
   const tp = e.target.closest('[data-topic]'); if (tp) { focusNode('t:' + tp.dataset.topic); openTopic(tp.dataset.topic); }
-  const ss = e.target.closest('[data-session]'); if (ss) loadSession(ss.dataset.session);
 });
 async function openEntity(id) {
   const d = await (await fetch(`/api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
@@ -647,14 +669,21 @@ document.addEventListener('click', e => {
   if (e.target.classList.contains('starter') || e.target.classList.contains('next')) send(e.target.textContent);
 });
 $('#calbtn').addEventListener('click', () => send('Put my plan in my calendar.'));
-$('#histbtn').addEventListener('click', async () => {
+function closeSide() { $('#side').classList.remove('on'); $('#sidebg').classList.remove('on'); }
+async function openSide() {
+  $('#side').classList.add('on'); $('#sidebg').classList.add('on');
+  $('#sesslist').innerHTML = '<div class="sidesub">loading…</div>';
   const d = await (await fetch('/api/sessions')).json();
-  const ago = ms => { const m = Math.round((Date.now() - ms) / 60000); return m < 60 ? m + 'm ago' : Math.round(m / 60) + 'h ago'; };
-  $('#dbox').innerHTML = `<h3>Previous sessions</h3><div class="sub">stored in FalkorDB · reopening one rebuilds it from the graph, no model calls</div>` +
-    (d.sessions.map(x => `<div class="dl link" data-session="${esc(x.id)}">${esc(x.title)} <span class="dim">· ${x.turns} turns · ${x.criteria} criteria · ${ago(x.updated)}</span></div>`).join('') || '<div class="dl dim">none yet</div>') +
-    `<div class="dsec">FalkorDB query</div><div class="dl"><code style="font:11px var(--mono);color:#9fb0c8">${esc(d.cypher)}</code> <span class="dim">${d.ms}ms</span></div>`;
-  $('#drawer').classList.add('on');
-});
+  const ago = ms => { const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? 'just now' : m < 60 ? m + 'm ago' : Math.round(m / 60) + 'h ago'; };
+  $('#sesslist').innerHTML = d.sessions.map(x => `<div class="sess ${x.id === sid ? 'cur' : ''}" data-session="${esc(x.id)}">
+      <div class="t">${esc(x.title)}</div><div class="m">${x.turns} turns · ${x.criteria} criteria · ${ago(x.updated)}</div></div>`).join('') || '<div class="sidesub">No sessions yet.</div>';
+  $('#sessq').innerHTML = `<code style="font:10.5px var(--mono);color:#6b7686">${esc(d.cypher)}</code> · ${d.ms}ms`;
+}
+$('#menu').addEventListener('click', openSide);
+$('#sideclose').addEventListener('click', closeSide);
+$('#sidebg').addEventListener('click', closeSide);
+$('#sesslist').addEventListener('click', e => { const x = e.target.closest('[data-session]'); if (x) { closeSide(); loadSession(x.dataset.session); } });
+$('#newsess').addEventListener('click', () => location.reload());
 async function loadSession(id) {
   const t = Date.now();
   const d = await (await fetch(`/api/session/load?sid=${encodeURIComponent(id)}`)).json();
