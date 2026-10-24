@@ -419,6 +419,19 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
             rel[eid] += 0.2 * float(sc)
         keep |= {r[0] for r in rows[:3]}
         yield ev("fulltext", crit=cid, cypher=cy, query=q, ms=ms, hits=[ENTITIES[r[0]]["name"] for r in rows[:3]])
+        if len(keep) < 5:
+            opts = {e["id"]: f"{e['name']}: {e['description'][:110]}" for e in ents}
+            a, ms = await systemone(config.ROUTER_MODEL, "GitHub Universe 2026 sponsor booths, talks and people.",
+                                    {"pick": {"type": "choice", "instructions": f"Which one best satisfies: {text}?",
+                                              "criteria": opts}})
+            probs = sorted(a["pick"]["probabilities"].items(), key=lambda x: -x[1])
+            for i, pr in probs:
+                rel[i] += pr
+            keep |= {i for i, _ in probs[:RETRIEVE_PER_CRIT]}
+            for kind in ("sponsor", "talk", "speaker", "person"):
+                keep |= {i for i, _ in [x for x in probs if ENTITIES[x[0]]["kind"] == kind][:2]}
+            yield ev("fallback", crit=cid, model=config.ROUTER_MODEL, ms=ms, n=len(opts),
+                     top=[[ENTITIES[i]["name"], round(pr, 3)] for i, pr in probs[:6]])
     keep |= {r["id"] for r in session.ranking()[:TOP_FOR_GAPS] if r["score"] > 0}
     ents = sorted((e for e in ents if e["id"] in keep), key=lambda e: -rel[e["id"]])
     yield ev("candidates", total=len(rel), kept=len(ents), names=[e["name"] for e in ents])

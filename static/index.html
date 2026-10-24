@@ -59,6 +59,21 @@ header span{color:var(--dim);font-size:13px}
 #q:focus{border-color:var(--crit)}
 @keyframes in{from{opacity:0;transform:translateY(4px)}}
 
+/* activity */
+.board{position:relative}
+#activity{display:none;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,rgba(245,180,69,.08),transparent 70%)}
+#activity.on{display:flex}
+#activity .spin{width:18px;height:18px;border-radius:50%;border:2px solid #2a303b;border-top-color:var(--gap);animation:spinr .8s linear infinite;flex:none}
+#activity.idle .spin{animation:none;border-color:var(--yes)}
+@keyframes spinr{to{transform:rotate(360deg)}}
+#activity .who{font:600 12px var(--mono);color:var(--gap);text-transform:uppercase;letter-spacing:.05em}
+#activity.idle .who{color:var(--yes)}
+#activity .what{font-size:15px;color:var(--text);margin-top:2px}
+#activity.big{position:absolute;inset:0;z-index:3;flex-direction:column;justify-content:center;text-align:center;border:none;background:var(--bg)}
+#activity.big .spin{width:36px;height:36px;border-width:3px}
+#activity.big .who{font-size:13px}
+#activity.big .what{font-size:22px;max-width:640px;line-height:1.35}
+
 /* matrix */
 .board{display:flex;flex-direction:column;min-width:0;min-height:0}
 .thead,.row{display:grid;align-items:center}
@@ -148,6 +163,7 @@ header span{color:var(--dim);font-size:13px}
   </section>
 
   <section class="board">
+    <div id="activity"><div class="spin"></div><div><div class="who" id="actwho"></div><div class="what" id="actwhat"></div></div></div>
     <div class="thead" id="thead"></div>
     <div id="rows"><div class="empty" id="empty"><div class="emptybox">
       <div class="lead">Tell it what you're working on.</div>
@@ -184,7 +200,18 @@ fetch('/api/entities').then(r => r.json()).then(list => {
   $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker') + n('person')} people`;
 });
 
-function status(t, b) { $('#status').textContent = t; $('#status').classList.toggle('busy', !!b); }
+let actTimer = 0;
+function status(t, b, who) {
+  $('#status').textContent = t; $('#status').classList.toggle('busy', !!b);
+  const a = $('#activity');
+  clearTimeout(actTimer);
+  if (who || b) {
+    $('#actwho').textContent = who || 'working';
+    $('#actwhat').textContent = t;
+    a.className = 'on' + (crits.length || rank.some(r => r.score > 0) ? '' : ' big') + (b ? '' : ' idle');
+  }
+  if (!b) actTimer = setTimeout(() => a.className = '', who ? 4000 : 0);
+}
 function trace(k, cls, html) {
   const d = document.createElement('div');
   d.innerHTML = `<span class="k ${cls}">${k}</span>${html}`;
@@ -360,9 +387,9 @@ function handle(ev) {
     case 'agent':
       if (ev.phase === 'start' && ev.via) {
         tfBox = chat(`<span class="model">${esc(ev.via)} agent · ${esc(ev.model)}</span><span class="thinking">thinking…</span>`, 'a');
-        status(`${ev.via}: ${ev.model} deciding which rubric tools to call`, 1); break;
+        status(`deciding which rubric tools to call (${ev.model})`, 1, `${ev.via} agent`); break;
       }
-      if (ev.phase === 'start') { chat(`<span class="thinking">${esc(ev.model)} editing the rubric…</span>`, 'a pending'); status(`${ev.model}: turning what you said into rubric edits`, 1); break; }
+      if (ev.phase === 'start') { chat(`<span class="thinking">${esc(ev.model)} editing the rubric…</span>`, 'a pending'); status(`turning what you said into rubric edits`, 1, ev.model); break; }
       if (ev.via && tfBox) {
         tfBox.querySelector('.thinking')?.remove();
         tfBox.querySelector('.model').textContent = `${ev.via} agent · ${ev.model} · ${(ev.ms / 1000).toFixed(1)}s`;
@@ -382,15 +409,21 @@ function handle(ev) {
       break;
     case 'topics': {
       const ct = crits.find(c => c.id === ev.crit)?.text || ev.crit;
+      status(`“${ct}” → ${ev.topics.map(([t]) => t.split(',')[0]).join(', ')}`, 1, 'FalkorDB · mapping onto topics');
       trace(s, 'fk', `“${esc(ct)}” → topics ${ev.topics.map(([t, p]) => `${esc(t.split(',')[0])} ${p.toFixed(2)}`).join(' · ')} <span style="color:var(--faint)">(${esc(ev.model)} ${ev.ms}ms, MAPS_TO written ${ev.gms}ms)</span>`);
       refreshGraph(); break;
     }
     case 'graph_search':
-      status(`FalkorDB shortestPath from your criterion: ${ev.hits} reachable`, 1);
+      status(`walked the graph from your criterion: ${ev.hits} reachable${ev.multihop.length ? ', incl. ' + ev.multihop.slice(0, 2).join(', ') + ' via people' : ''}`, 1, 'FalkorDB shortestPath');
       trace(s, 'fk', `shortestPath → ${ev.hits} reachable (${ev.ms}ms) · direct: ${esc(ev.direct.slice(0, 5).join(', '))}${ev.multihop.length ? ` · via people: <b>${esc(ev.multihop.join(', '))}</b>` : ''}<br><code>${esc(ev.cypher)}</code>`);
+      break;
+    case 'fallback':
+      status(`graph had too few routes — one pass over all ${ev.n} with ${ev.model}`, 1, 'Fallback shortlist');
+      trace(s, 's1', `graph routes thin → ${esc(ev.model)} choice over ${ev.n} (${ev.ms}ms): ` + ev.top.map(([n, p]) => `${esc(n)} ${p.toFixed(2)}`).join(' · '));
       break;
     case 'fulltext': trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
     case 'why':
+      status('tracing your path to each top pick', 1, 'FalkorDB shortestPath');
       ev.items.forEach(it => why[it.id] = it); render();
       trace(s, 'fk', `why: shortestPath from you to top ${ev.items.length} (${ev.ms}ms)<br>` + ev.items.map(it => `${esc(E[it.id]?.name)}: ${esc(pathText(it))}`).join('<br>'));
       highlightPath(ev.items[0]); break;
@@ -442,7 +475,7 @@ function handle(ev) {
     }
     case 'candidates': status(`${ev.total} in graph → ${ev.kept} candidates to score`, 1); trace(s, 'fk', `retrieve ${ev.kept}/${ev.total}: ${esc(ev.names.slice(0, 6).join(', '))}…`); break;
     case 's1_call':
-      if (ev.phase === 'start') status(`${ev.model}: ${ev.questions} decisions (${ev.entities} × ${ev.questions / ev.entities} criteria)`, 1);
+      if (ev.phase === 'start') status(`scoring ${ev.entities} candidates against your rubric (${ev.questions} decisions)`, 1, `System One ${ev.model}`);
       else trace(s, 's1', `${ev.model} · ${ev.questions} noul decisions · ${ev.ms}ms`);
       break;
     case 'cells':
@@ -457,16 +490,17 @@ function handle(ev) {
         }
       });
       render(); break;
-    case 'gap': setCell(ev.e, ev.c, {state: 'gap', p: ev.p}); render(); status(`gap: unsure whether ${E[ev.e]?.name} fits (p=${ev.p.toFixed(2)})`, 1); break;
+    case 'gap': setCell(ev.e, ev.c, {state: 'gap', p: ev.p}); render(); status(`not sure whether ${E[ev.e]?.name} fits (${ev.p.toFixed(2)}) — deciding how to find out`, 1, 'Gap found'); break;
     case 'route':
       setCell(ev.e, ev.c, {state: 'route', probs: ev.probs, chosen: ev.chosen}); render();
+      status(`${E[ev.e]?.name}: chose ${STRAT[ev.chosen]} (${(ev.probs[ev.chosen] || 0).toFixed(2)})`, 1, `System One ${ev.model} · picking a Bright Data strategy`);
       trace(s, 'bd', `route ${esc(E[ev.e]?.name)} → <b>${STRAT[ev.chosen]}</b> ${Object.entries(ev.probs).map(([k, v]) => `${STRAT[k]} ${v.toFixed(2)}`).join(' · ')} (${ev.model}, ${ev.ms}ms)`);
       break;
     case 'fetch': {
       const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `SERP API: ${ev.target}`) :
         ev.product === 'Web Unlocker' ? `reading ${host(ev.target)}` : `rendering ${host(ev.target)} in browser`;
       setTimeout(() => { setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
-      trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(`${ev.product}: ${ev.target}`, 1);
+      trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(doing + ` (for ${E[ev.e]?.name})`, 1, `Bright Data ${ev.product}`);
       break;
     }
     case 'evidence':
@@ -475,10 +509,10 @@ function handle(ev) {
       break;
     case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
     case 'graph': refreshGraph(); if (ev.op !== 'scored') trace(s, 'fk', `${ev.op} (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); else trace(s, 'fk', `wrote ${ev.n} SCORED edges (${ev.ms}ms)`); break;
-    case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1); tfBox = null;
+    case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1, 'Redirected'); tfBox = null;
       document.querySelectorAll('.cell.gap, .cell.route, .cell.fetch').forEach(() => {});
       Object.values(cells).forEach(c => { if (['gap', 'route', 'fetch'].includes(c.state)) c.state = 'done'; }); render(); break;
-    case 'done': busy = false; status(`done in ${(ev.ms / 1000).toFixed(1)}s`); offerNext(); break;
+    case 'done': busy = false; status(`ranked, explained and cited in ${(ev.ms / 1000).toFixed(1)}s — say something to redirect it`, 0, 'Done'); offerNext(); break;
     case 'error': busy = false; status('error: ' + ev.text); trace(s, 'bd', 'error ' + esc(ev.text)); break;
   }
 }
