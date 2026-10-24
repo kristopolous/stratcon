@@ -47,6 +47,7 @@ def ev(type_: str, **kw) -> dict:
 
 
 ENTITIES: dict[str, dict] = {}
+ACTIVE = None
 
 
 async def load_entities():
@@ -84,6 +85,9 @@ class Session:
         self.cells: dict[tuple[str, str], dict] = {}
         self.tried: dict[tuple[str, str], list] = {}
         self.history: list[dict] = []
+        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.ops: list[dict] = []
+        self.tf_id: str | None = None
 
     def entities(self):
         if self.scope == "sponsors":
@@ -141,6 +145,80 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
     out = json.loads(m.group(0)) if m else {"ops": [], "reply": content.strip()[:200]}
     session.history += [{"role": "user", "content": text}, {"role": "assistant", "content": json.dumps(out)}]
     return out, int((time.time() - t) * 1000)
+
+
+TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubric only through the stratcon tools: \
+add_criterion, reweight, remove_criterion, set_scope (call get_rubric if you need criterion ids). Make every edit \
+the attendee's message implies, then reply with one short sentence. Rules: at most 5 criteria. "matters less" / \
+"more important" means reweight; "forget" / "drop" / "no longer" means remove. If they bring back something from \
+earlier, add it back with the same wording as before. Phrase each criterion in 8 words or fewer."""
+
+_tf = None
+
+
+def tf_client():
+    global _tf
+    if _tf is None:
+        from trueforge_sdk import AsyncTrueForge
+        _tf = AsyncTrueForge(base_url=config.TRUEFORGE_URL, token=config.TRUEFORGE_TOKEN or None, timeout=180)
+    return _tf
+
+
+def _text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(getattr(p, "text", "") or (p.get("text", "") if isinstance(p, dict) else "") for p in content)
+    return str(content)
+
+
+async def agent_trueforge(session: "Session", text: str):
+    global ACTIVE
+    import inspect
+    import trueforge_sdk as t
+    c = tf_client()
+    t0 = time.time()
+    if not session.tf_id:
+        spec = t.AgentSpec(model=t.Model(name=config.TRUEFORGE_MODEL), instructions=TF_PROMPT,
+                           mcp_servers=[t.McpServer(name=config.MCP_NAME, enable_tools=["@all"])])
+        r = await c.sessions.create(agent=t.SessionAgentSpecBody(spec=spec), metadata={"stratcon_sid": session.sid})
+        session.tf_id = getattr(getattr(r, "data", r), "id")
+        yield ev("tf_session", id=session.tf_id, ms=int((time.time() - t0) * 1000))
+    session.ops = []
+    ACTIVE = session
+    rubric = [{"id": k["id"], "text": k["text"], "weight": k["weight"]} for k in session.criteria.values()]
+    reply, status = "", ""
+    try:
+        res = c.sessions.create_turn_stream(
+            session_id=session.tf_id,
+            input=[t.UserMessage(type="user.message",
+                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\nAttendee says: {text}")])
+        if inspect.isawaitable(res):
+            res = await res
+        async for e in res:
+            kind = getattr(e, "type", "")
+            if kind == "mcp.initialize":
+                yield ev("tf_mcp", servers=[getattr(m, "name", "") for m in (e.mcp_servers or [])])
+            elif kind == "model.message":
+                if _text(e.content).strip():
+                    reply = _text(e.content).strip()
+                for tc in e.tool_calls or []:
+                    yield ev("tf_tool_call", id=tc.id, name=tc.function.name, args=tc.function.arguments,
+                             model=getattr(e, "model", None))
+            elif kind == "tool.response":
+                yield ev("tf_tool_result", id=e.tool_call_id, content=_text(e.content)[:300])
+            elif kind == "turn.done":
+                status = getattr(e.state, "status", "")
+            while not session.inbox.empty():
+                yield session.inbox.get_nowait()
+    finally:
+        ACTIVE = None
+    while not session.inbox.empty():
+        yield session.inbox.get_nowait()
+    yield ev("agent", phase="done", model=config.TRUEFORGE_MODEL, via="TrueForge", status=status,
+             ms=int((time.time() - t0) * 1000), ops=session.ops, reply=reply)
 
 
 async def apply_ops(session: Session, ops: list[dict]):
@@ -438,13 +516,18 @@ async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
 async def turn(session: Session, text: str):
     t0 = time.time()
     yield ev("user", text=text)
-    yield ev("agent", phase="start", model=config.LLM_MODEL)
-    out, ms = await agent(session, text)
-    yield ev("agent", phase="done", model=config.LLM_MODEL, ms=ms, ops=out.get("ops", []), reply=out.get("reply", ""))
     before = set(session.criteria)
     scope_before = session.scope
-    for e in await apply_ops(session, out.get("ops", [])):
-        yield e
+    if config.TRUEFORGE_URL:
+        yield ev("agent", phase="start", model=config.TRUEFORGE_MODEL, via="TrueForge")
+        async for e in agent_trueforge(session, text):
+            yield e
+    else:
+        yield ev("agent", phase="start", model=config.LLM_MODEL)
+        out, ms = await agent(session, text)
+        yield ev("agent", phase="done", model=config.LLM_MODEL, ms=ms, ops=out.get("ops", []), reply=out.get("reply", ""))
+        for e in await apply_ops(session, out.get("ops", [])):
+            yield e
     yield ev("rubric", criteria=list(session.criteria.values()), scope=session.scope)
     yield ev("rank", rows=session.ranking())
 

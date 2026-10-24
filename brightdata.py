@@ -57,7 +57,7 @@ async def _ws() -> str:
 
 async def browser(url: str, scroll: int = 2, links_text: str | None = None) -> dict:
     t = time.time()
-    links = []
+    links, images = [], []
     async with async_playwright() as p:
         b = await p.chromium.connect_over_cdp(await _ws())
         try:
@@ -71,7 +71,9 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None) -> d
             if links_text:
                 links = await page.eval_on_selector_all(
                     "a", "(els, t) => els.filter(e => e.innerText.trim() === t).map(e => e.href)", links_text)
+            images = await page.eval_on_selector_all("img", "els => els.map(e => [e.alt || '', e.src])")
         finally:
             await b.close()
     return {"product": "Browser API", "strategy": "render_browser", "target": url, "status": 200,
-            "bytes": len(text.encode()), "ms": int((time.time() - t) * 1000), "text": text, "links": links}
+            "bytes": len(text.encode()), "ms": int((time.time() - t) * 1000), "text": text, "links": links,
+            "images": images}

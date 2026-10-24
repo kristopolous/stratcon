@@ -61,6 +61,10 @@ header span{color:var(--dim);font-size:13px}
 .ent .m{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ent .why{font-size:11.5px;color:var(--yes);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px}
+.ent{display:flex;align-items:center;gap:10px;min-width:0}
+.ent .txt{min-width:0}
+.logo{flex:none;width:58px;height:26px;border-radius:4px;object-fit:cover;background:#1a1f27}
+.logo.person{width:34px;height:34px;border-radius:50%;object-fit:cover}
 .score{font:600 15px var(--mono);text-align:right}
 .score small{display:block;font:11px var(--mono);color:var(--faint)}
 
@@ -147,7 +151,7 @@ header span{color:var(--dim);font-size:13px}
 const RH = 66, SHOW = 12;
 document.documentElement.style.setProperty('--rh', RH + 'px');
 const sid = 's' + Math.random().toString(36).slice(2, 9);
-const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0;
+const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0, tfBox = null;
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u || ''; } };
@@ -221,8 +225,8 @@ function doRender() {
     el.style.gridTemplateColumns = cols();
     el.style.transform = `translateY(${i * RH}px)`;
     el.innerHTML = `<div class="rk">${i + 1}</div>
-      <div class="ent"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' ? 'var(--speaker)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
-      ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · speaker' : e.tier + ' sponsor')}</div>`}</div>
+      <div class="ent">${e.logo ? `<img class="logo ${e.kind === 'speaker' ? 'person' : ''}" src="${esc(e.logo)}" alt="" loading="lazy">` : ''}<div class="txt"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' ? 'var(--speaker)' : e.kind === 'talk' ? 'var(--crit)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
+      ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · speaker' : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
       <div class="score">${(r.score * 100).toFixed(0)}</div>` + crits.map(c => cellHTML(r.id, c)).join('');
   });
   box.style.minHeight = top.length * RH + 'px';
@@ -281,7 +285,18 @@ function handle(ev) {
   const s = ((ev.t - t0)).toFixed(1) + 's';
   switch (ev.type) {
     case 'agent':
+      if (ev.phase === 'start' && ev.via) {
+        tfBox = chat(`<span class="model">${esc(ev.via)} agent · ${esc(ev.model)}</span><span class="thinking">thinking…</span>`, 'a');
+        status(`${ev.via}: ${ev.model} deciding which rubric tools to call`, 1); break;
+      }
       if (ev.phase === 'start') { chat(`<span class="thinking">${esc(ev.model)} editing the rubric…</span>`, 'a pending'); status(`${ev.model}: turning what you said into rubric edits`, 1); break; }
+      if (ev.via && tfBox) {
+        tfBox.querySelector('.thinking')?.remove();
+        tfBox.querySelector('.model').textContent = `${ev.via} agent · ${ev.model} · ${(ev.ms / 1000).toFixed(1)}s`;
+        tfBox.insertAdjacentHTML('beforeend', `<div class="reply">${esc(ev.reply)}</div>`);
+        trace(s, 'ag', `${esc(ev.via)} turn ${esc(ev.status)} · ${(ev.ops || []).length} tool calls executed (${ev.ms}ms)`);
+        tfBox = null; break;
+      }
       document.querySelector('.a.pending')?.remove();
       chat(`<span class="model">${esc(ev.model)} · ${(ev.ms / 1000).toFixed(1)}s</span>` + (ev.ops || []).map(o =>
         o.op === 'add' ? `<div class="tool"><span class="fn">add_criterion</span>("${esc(o.text)}", ${o.weight})</div>` :
@@ -290,6 +305,24 @@ function handle(ev) {
         `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${esc(ev.reply)}</div>`, 'a');
       trace(s, 'ag', `${esc(ev.model)} → ${(ev.ops || []).length} tool calls (${ev.ms}ms)`);
       break;
+    case 'tf_session': trace(s, 'ag', `TrueForge session ${esc(ev.id)} (${ev.ms}ms)`); break;
+    case 'tf_mcp': trace(s, 'ag', `TrueForge connected MCP: ${esc(ev.servers.join(', '))}`); break;
+    case 'tf_tool_call': {
+      let a = {}; try { a = JSON.parse(ev.args || '{}'); } catch {}
+      const label = id => esc(crits.find(c => c.id === id)?.text || id);
+      const body = ev.name === 'add_criterion' ? `"${esc(a.text)}", ${a.weight}` : ev.name === 'reweight' ? `"${label(a.criterion_id)}", ${crits.find(c => c.id === a.criterion_id)?.weight ?? '?'} → ${a.weight}` :
+        ev.name === 'remove_criterion' ? `"${label(a.criterion_id)}"` : ev.name === 'set_scope' ? `"${esc(a.scope)}"` : '';
+      const cls = ev.name === 'remove_criterion' ? 'rm' : ev.name === 'reweight' ? 'rw' : '';
+      (tfBox || chat('', 'a')).insertAdjacentHTML('beforeend', `<div class="tool ${cls}" data-call="${esc(ev.id)}"><span class="fn">${esc(ev.name)}</span>(${body}) <span class="ok" style="color:var(--faint)">…</span></div>`);
+      trace(s, 'ag', `TrueForge tool_call ${esc(ev.name)} ${esc(ev.args || '')}`);
+      break;
+    }
+    case 'tf_tool_result': {
+      const el = document.querySelector(`.tool[data-call="${CSS.escape(ev.id)}"] .ok`);
+      if (el) { el.textContent = '✓ via MCP'; el.style.color = 'var(--yes)'; }
+      trace(s, 'ag', `tool.response ${esc(ev.content.slice(0, 120))}`);
+      break;
+    }
     case 'rubric': crits = ev.criteria; renderHead(); render(); break;
     case 'reweight': trace(s, 'ag', `reweight ${esc(ev.crit)} ${ev.before} → ${ev.after}`); break;
     case 'rank': rank = ev.rows; render(); break;

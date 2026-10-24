@@ -1,27 +1,35 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import engine
+import mcp_tools
 
-app = FastAPI(title="StratCon")
 HERE = os.path.dirname(__file__)
 sessions: dict[str, engine.Session] = {}
+mcp_app = mcp_tools.app()
+
+
+@asynccontextmanager
+async def lifespan(_):
+    await engine.load_entities()
+    asyncio.create_task(engine.warmup())
+    async with mcp_tools.mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="StratCon", lifespan=lifespan)
+app.mount("/tools", mcp_app)
 
 
 def session(sid: str) -> engine.Session:
     if sid not in sessions:
         sessions[sid] = engine.Session(sid)
     return sessions[sid]
-
-
-@app.on_event("startup")
-async def startup():
-    await engine.load_entities()
-    asyncio.create_task(engine.warmup())
 
 
 @app.get("/")
