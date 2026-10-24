@@ -183,10 +183,16 @@ async def enrich(id: str):
     if not e or e["kind"] not in ("person", "speaker"):
         return JSONResponse({"error": "not a person"}, status_code=400)
     rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials, p.li_profile, "
-                              "p.li_snapshot, p.li_ms", {"id": id})
+                              "p.li_snapshot, p.li_ms, p.photo, p.photo_src", {"id": id})
     if rows and (rows[0][0] or rows[0][3]):
         out = {"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
                "other": json.loads(rows[0][3]) if rows[0][3] else []}
+        if rows[0][7]:
+            out["photo"] = {"url": rows[0][7], "source": rows[0][8] or "LinkedIn", "product": "graph memory"}
+        elif out["other"]:
+            gh = await _github_photo(id, [o["url"] for o in out["other"]])
+            if gh:
+                out["photo"] = gh
         if rows[0][4]:
             out["scraper"] = {"product": "Web Scraper API · LinkedIn people profiles", "status": "ready", "cached": True,
                               "snapshot": rows[0][5], "ms": rows[0][6], "profile": json.loads(rows[0][4])}
@@ -213,12 +219,36 @@ async def enrich(id: str):
         await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
                         {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
                          "ms": max(r1["ms"], r2["ms"])})
+    gh = await _github_photo(id, [x["link"] for x in r2["results"]] + [x["url"] for x in out["other"]])
+    if gh:
+        out["photo"] = gh
     if hit:
         out["scraper"] = await _linkedin(id, hit["link"].split("?")[0])
     return JSONResponse(out)
 
 
 LI_JOBS: dict[str, dict] = {}
+
+
+async def _github_photo(id: str, links: list[str]) -> dict | None:
+    """Bright Data Web Unlocker on the person's GitHub profile; the avatar is public even when LinkedIn's isn't."""
+    import re as _re
+    import brightdata
+    user = next((m.group(1) for l in links if (m := _re.match(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?$", l))
+                 and m.group(1).lower() not in ("orgs", "topics", "features", "about", "github")), None)
+    if not user:
+        return None
+    r = await brightdata._request(f"https://github.com/{user}", None)
+    m = _re.search(r"https://avatars\.githubusercontent\.com/u/\d+\?v=\d+", r[1]) if r[0] == 200 else None
+    if not m:
+        return None
+    out = {"url": m.group(0) + "&s=200", "source": f"github.com/{user}", "product": "Web Unlocker"}
+    await engine.gq("MATCH (p {id:$id}) SET p.photo = CASE WHEN p.photo IS NULL OR p.photo = '' THEN $u ELSE p.photo END, "
+                    "p.photo_src = CASE WHEN p.photo_src IS NULL THEN $src ELSE p.photo_src END",
+                    {"id": id, "u": out["url"], "src": out["source"]})
+    if id in engine.ENTITIES and not engine.ENTITIES[id].get("logo"):
+        engine.ENTITIES[id]["logo"] = out["url"]
+    return out
 
 
 async def _linkedin(id: str, url: str) -> dict:
