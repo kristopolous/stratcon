@@ -343,7 +343,8 @@ async function openEntity(id) {
     box.innerHTML = `<div class="dsec">who is this</div><div class="dl dim">looking them up with Bright Data SERP API…</div>`;
     $('#dbox').insertBefore(box, $('#dbox').children[2]);
     const render1 = p => {
-      const sc = p.scraper, pr = sc && sc.profile;
+      const sc = p.scraper, pr = sc && sc.profile ? {...sc.profile} : (p.photo ? {name: e.name} : null);
+      if (pr && !pr.photo && p.photo) pr.photo = p.photo.url;
       box.innerHTML = `<div class="dsec">who is this</div>` +
         (pr ? `<div class="dl" style="display:flex;gap:12px;align-items:center">${pr.photo ? `<img src="${esc(pr.photo)}" style="width:64px;height:64px;border-radius:50%;object-fit:cover">` : ''}
           <div><b>${esc(pr.name || e.name)}</b>${pr.company ? ` · ${esc(pr.company)}` : ''}${pr.city ? `<br><span class="dim">${esc(pr.city)}${pr.followers ? ` · ${pr.followers.toLocaleString()} followers` : ''}</span>` : ''}</div></div>` +
@@ -351,6 +352,7 @@ async function openEntity(id) {
         (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
         (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
         (sc ? `<div class="dl" style="font:11.5px var(--mono);color:${sc.status === 'ready' ? 'var(--yes)' : 'var(--gap)'}">Bright Data ${esc(sc.product)} · snapshot ${esc(sc.snapshot || '')} · ${sc.status === 'ready' ? (sc.cached ? 'from graph memory' : `ready in ${((sc.ms || 0) / 1000).toFixed(0)}s`) : `running ${sc.elapsed}s…`}</div>` : '') +
+        (p.photo ? `<div class="dl" style="font:11.5px var(--mono);color:var(--yes)">photo: Bright Data ${esc(p.photo.product)} · ${esc(p.photo.source)}</div>` : '') +
         (p.cached ? '' : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s</div>`).join(''));
       if (pr && pr.photo) { E[e.id].logo = pr.photo; render(); }
     };
@@ -607,12 +609,14 @@ async function lookupPeople() {
   for (const r of people) {
     trace(((Date.now() / 1000) - t0).toFixed(1) + 's', 'bd', `Bright Data LinkedIn people profiles → ${esc(E[r.id].name)}`);
     let p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
+    if (p.photo) { E[r.id].logo = p.photo.url; render(); }
     for (let i = 0; i < 40 && p.scraper && p.scraper.status === 'running'; i++) {
       await new Promise(res => setTimeout(res, 6000));
       p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
     }
     const pr = p.scraper && p.scraper.profile;
-    if (pr && pr.photo) { E[r.id].logo = pr.photo; render(); }
+    const ph = (pr && pr.photo) || (p.photo && p.photo.url);
+    if (ph) { E[r.id].logo = ph; render(); }
     if (pr) trace('', 'bd', `LinkedIn ✓ ${esc(pr.name || E[r.id].name)}${pr.company ? ' · ' + esc(pr.company) : ''}${pr.photo ? ' · photo' : ''}`);
   }
 }
