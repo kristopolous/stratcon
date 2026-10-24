@@ -143,7 +143,7 @@ header span{color:var(--dim);font-size:13px}
   <section class="chat">
     <div id="log"></div>
     <div class="compose">
-      <input id="q" placeholder="What are you here for?" autocomplete="off">
+      <input id="q" placeholder="What are you here for? (you can redirect it any time)" autocomplete="off">
     </div>
   </section>
 
@@ -151,11 +151,11 @@ header span{color:var(--dim);font-size:13px}
     <div class="thead" id="thead"></div>
     <div id="rows"><div class="empty" id="empty"><div class="emptybox">
       <div class="lead">Tell it what you're working on.</div>
-      <div class="sub2">Every sponsor booth, talk and speaker at GitHub Universe 2026 gets scored against what you say.</div>
+      <div class="sub2">Every sponsor booth, talk and person presenting at GitHub Universe 2026 is in the graph. Say what you want, then steer it.</div>
       <div class="starters">
-        <button class="starter">Coding agents keep breaking our CI/CD pipelines and builds take forever.</button>
-        <button class="starter">We ship AI-written code nobody understands. I need debugging and code comprehension.</button>
-        <button class="starter">We need isolated sandboxes to safely run and test what our agents generate.</button>
+        <button class="starter">I'm looking for a job.</button>
+        <button class="starter">I want to meet interesting people.</button>
+        <button class="starter">I want to keep up with where AI coding is going.</button>
       </div></div></div></div>
   </section>
 
@@ -181,7 +181,7 @@ const STRAT = {web_search: 'search', read_site: 'read site', render_browser: 're
 fetch('/api/entities').then(r => r.json()).then(list => {
   list.forEach(e => E[e.id] = e);
   const n = k => list.filter(e => e.kind === k).length;
-  $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker')} featured speakers`;
+  $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker') + n('person')} people`;
 });
 
 function status(t, b) { $('#status').textContent = t; $('#status').classList.toggle('busy', !!b); }
@@ -222,7 +222,20 @@ function cellHTML(eid, c) {
     <span class="v">${p.toFixed(2)}</span>${tag ? `<span class="tag">${esc(tag)}</span>` : ''}</div>`;
 }
 
+const why = {};
+const VERB = {WANTS: '→', MAPS_TO: '→', COVERS: '→', PRESENTED_BY: '← presented by', WORKS_AT: '→ works at', EMPLOYS: '→ employs', PRESENTS: '→ presents'};
+function pathText(w) {
+  const parts = [];
+  w.nodes.forEach(([label, id, name], i) => {
+    if (label === 'User') return;
+    const short = name.length > 34 ? name.slice(0, 32) + '…' : name;
+    const nm = label === 'Topic' ? short.split(',')[0] : label === 'Criterion' ? `“${short.toLowerCase()}”` : short;
+    parts.push(i > 1 ? `${VERB[w.rels[i - 1]] || '→'} ${nm}` : nm);
+  });
+  return parts.join(' ');
+}
 function because(eid) {
+  if (why[eid]) return 'because: ' + pathText(why[eid]) + (why[eid].evidence && why[eid].evidence.url ? ` — ${host(why[eid].evidence.url)}` : '');
   let best = null;
   crits.forEach(c => { const x = cells[eid + '|' + c.id]; if (x && c.weight > 0 && x.p >= .6) { const s = c.weight * x.p; if (!best || s > best.s) best = {s, c, x}; } });
   if (!best) return '';
@@ -247,8 +260,8 @@ function doRender() {
     el.style.gridTemplateColumns = cols();
     el.style.transform = `translateY(${i * RH}px)`;
     el.innerHTML = `<div class="rk">${i + 1}</div>
-      <div class="ent">${e.logo ? `<img class="logo ${e.kind === 'speaker' ? 'person' : ''}" src="${esc(e.logo)}" alt="" loading="lazy">` : ''}<div class="txt"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' ? 'var(--speaker)' : e.kind === 'talk' ? 'var(--crit)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
-      ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · speaker' : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
+      <div class="ent">${e.logo ? `<img class="logo ${e.kind === 'speaker' ? 'person' : ''}" src="${esc(e.logo)}" alt="" loading="lazy">` : ''}<div class="txt"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' || e.kind === 'person' ? 'var(--speaker)' : e.kind === 'talk' ? 'var(--crit)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
+      ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · featured speaker' : e.kind === 'person' ? (e.tier ? e.tier + ' · ' : '') + e.org : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
       <div class="score">${(r.score * 100).toFixed(0)}</div>` + crits.map(c => cellHTML(r.id, c)).join('');
   });
   box.style.minHeight = top.length * RH + 'px';
@@ -272,19 +285,21 @@ $('#drawer').addEventListener('click', e => {
 async function openEntity(id) {
   const d = await (await fetch(`/api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
   if (d.error) return;
-  const e = d.entity, kind = e.kind === 'talk' ? `${e.tier || 'Talk'} · ${e.when}${e.room ? ' · ' + e.room : ''}` : e.kind === 'speaker' ? `Featured speaker · ${e.org}` : `${e.tier} sponsor`;
+  const e = d.entity, kind = e.kind === 'talk' ? `${e.tier || 'Talk'} · ${e.when}${e.room ? ' · ' + e.room : ''}` : e.kind === 'speaker' ? `Featured speaker · ${e.org}` : e.kind === 'person' ? `${e.tier} · ${e.org} · presenting` : `${e.tier} sponsor`;
   const host2 = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u; } };
   $('#dbox').innerHTML = `
     <div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">${e.logo ? `<img src="${esc(e.logo)}" class="logo ${e.kind === 'speaker' ? 'person' : ''}" style="width:${e.kind === 'speaker' ? 56 : 120}px;height:${e.kind === 'speaker' ? 56 : 53}px">` : ''}
       <div><h3>${esc(e.name)}</h3><div class="sub" style="margin:0">${esc(kind)}${d.score != null ? ` · score ${(d.score * 100).toFixed(0)}` : ''}</div></div></div>
     <p style="font-size:13px;color:#cdd3dc;line-height:1.5;margin-bottom:12px">${esc(e.description)}</p>
+    ${why[e.id] ? `<div class="dsec">your path to it (FalkorDB shortestPath)</div><div class="dl">${esc(pathText(why[e.id]))}</div>` : ''}
     <div class="dsec">official listing</div>
-    ${d.sources.map(src => `<div class="dl"><a href="${esc(src.url)}" target="_blank">${esc(src.url.replace(/^https:\/\//, ''))}</a> <span class="dim">· fetched with ${esc(src.product)}</span></div>`).join('')}
+    ${d.sources.map(src => `<div class="dl"><a href="${esc(src.url)}" target="_blank">${esc(src.url.replace(/^https:\/\//, ''))}</a> <span class="dim">· fetched with Bright Data ${esc(src.product)}${src.ms ? ` · ${(src.ms / 1000).toFixed(1)}s · ${Math.round((src.bytes || 0) / 1024)} KB` : ''}</span></div>`).join('')}
     ${e.url ? `<div class="dl"><a href="${esc(e.url)}" target="_blank">${esc(host2(e.url))}</a> <span class="dim">· website discovered by search, remembered in graph</span></div>` : ''}
     ${d.scores.length ? `<div class="dsec">against your rubric</div>` + d.scores.map(sc => `<div class="dl"><b style="font-family:var(--mono);color:${sc.p >= .6 ? 'var(--yes)' : sc.p == null ? 'var(--faint)' : 'var(--dim)'}">${sc.p == null ? '  · ' : sc.p.toFixed(2)}</b> ${esc(sc.criterion)} <span class="dim">(weight ${sc.weight})</span>${sc.evidence ? `<blockquote>${esc(sc.evidence.snippet)}<br><a href="${esc(sc.evidence.url)}" target="_blank">${esc(host2(sc.evidence.url))}</a> · ${esc(sc.evidence.product)}</blockquote>` : ''}</div>`).join('') : ''}
     ${d.related.length ? `<div class="dsec">${e.kind === 'sponsor' ? `talks by people from ${esc(e.name.split(',')[0])}` : e.kind === 'speaker' ? 'talks' : 'presenters'}</div>` +
       d.related.map(r => r.id ? `<div class="dl link" data-open="${esc(r.id)}"><span class="dim">${esc(r.label)}</span> ${esc(r.name)} <span class="dim">· ${esc(r.when)}${r.room ? ' · ' + esc(r.room) : ''}</span></div>` : `<div class="dl">${esc(r.label)}${r.also && r.also.length ? ` <span class="dim">· also: ${esc(r.also.join('; '))}</span>` : ''}</div>`).join('') : ''}
     ${d.evidence.length ? `<div class="dsec">evidence in graph</div>` + d.evidence.map(x => `<div class="dl"><span class="dim">${esc(x.product)} · ${esc(x.criterion || '')}</span><br>${esc((x.snippet || '').slice(0, 220))} <a href="${esc(x.url)}" target="_blank">${esc(host2(x.url))}</a></div>`).join('') : ''}
+    ${d.calls.length ? `<div class="dsec">Bright Data requests for this</div>` + d.calls.map(c => `<div class="dl" style="font:12px var(--mono)"><span style="color:${c.ok ? 'var(--yes)' : '#e5636b'}">${c.ok ? '✓' : '✗'}</span> ${esc(c.product)} <span class="dim">[${esc(c.strategy)}]</span> ${esc(c.target)} <span class="dim">· ${(c.ms / 1000).toFixed(1)}s · ${Math.round(c.bytes / 1024)} KB · for “${esc(c.criterion)}”</span></div>`).join('') : ''}
     <div class="dsec">FalkorDB queries</div>${d.queries.map(q => `<div class="dl"><code style="font:11px var(--mono);color:#9fb0c8;white-space:pre-wrap">${esc(q.cypher)}</code> <span class="dim">${q.ms}ms</span></div>`).join('')}`;
   $('#drawer').classList.add('on');
 }
@@ -296,7 +311,14 @@ svg.call(d3.zoom().scaleExtent([0.3, 5]).on('zoom', e => gz.attr('transform', e.
 const sim = d3.forceSimulation().force('link', d3.forceLink().id(d => d.id).distance(l => l.kind === 'evidence' ? 28 : l.kind === 'wants' ? 70 : 60))
   .force('charge', d3.forceManyBody().strength(-160)).force('collide', d3.forceCollide(16)).alphaDecay(.03);
 let gnodes = [], glinks = [], gtimer = 0;
-const color = k => ({user: '#fff', criterion: 'var(--crit)', sponsor: 'var(--sponsor)', speaker: 'var(--speaker)', talk: '#c4b5fd', evidence: '#ddd'}[k] || '#888');
+const color = k => ({user: '#fff', criterion: 'var(--crit)', topic: '#7aa2ff', person: '#9aa3b2', sponsor: 'var(--sponsor)', speaker: 'var(--speaker)', talk: '#c4b5fd', evidence: '#ddd'}[k] || '#888');
+let pathIds = new Set();
+function highlightPath(item) {
+  if (!item) return;
+  pathIds = new Set(item.nodes.map(([label, id, name]) => label === 'User' ? 'you' : label === 'Topic' ? 't:' + id : label === 'Person' ? 'p:' + name : id));
+  gn.selectAll('g circle').attr('stroke', d => pathIds.has(d.id) ? '#fff' : null).attr('stroke-width', d => pathIds.has(d.id) ? 2 : 0);
+  gl.selectAll('line').attr('stroke-opacity', d => pathIds.has(d.source.id || d.source) && pathIds.has(d.target.id || d.target) ? 1 : .35);
+}
 function refreshGraph() { clearTimeout(gtimer); gtimer = setTimeout(loadGraph, 500); }
 async function loadGraph() {
   const g = await (await fetch('/api/graph?sid=' + sid)).json();
@@ -308,7 +330,7 @@ async function loadGraph() {
   $('#gcap').textContent = `FalkorDB · ${gnodes.length} nodes · ${glinks.length} edges · ${g.ms}ms`;
   const L = gl.selectAll('line').data(glinks, d => d.source + '>' + d.target);
   L.exit().remove();
-  L.enter().append('line').attr('stroke', d => d.kind === 'evidence' ? '#ddd' : d.kind === 'wants' ? '#5b4b8a' : '#2f6b52')
+  L.enter().append('line').attr('stroke', d => d.kind === 'evidence' ? '#ddd' : d.kind === 'wants' ? '#5b4b8a' : d.kind === 'maps' ? '#3d5a99' : d.kind === 'person' ? '#555c69' : '#2f6b52')
     .attr('stroke-width', d => d.kind === 'scored' ? 1 + 3 * (d.p - .5) * 2 : 1).attr('stroke-opacity', .8);
   const N = gn.selectAll('g').data(gnodes, d => d.id);
   N.exit().remove();
@@ -317,7 +339,7 @@ async function loadGraph() {
     .call(d3.drag().on('start', (e, d) => { if (!e.active) sim.alphaTarget(.3).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; }).on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
   ne.append('title').text(d => d.label);
-  ne.append('circle').attr('r', d => d.kind === 'user' ? 9 : d.kind === 'evidence' ? 3.5 : d.kind === 'criterion' ? 7 : 6)
+  ne.append('circle').attr('r', d => d.kind === 'user' ? 9 : d.kind === 'evidence' ? 3.5 : d.kind === 'person' ? 4 : d.kind === 'criterion' || d.kind === 'topic' ? 7 : 6)
     .attr('fill', d => color(d.kind)).attr('opacity', 0).transition().duration(600).attr('opacity', 1);
   ne.append('text').attr('x', 9).attr('y', 3.5).attr('fill', '#9aa3b2').attr('font-size', d => d.kind === 'evidence' ? 8.5 : 10)
     .attr('font-family', 'Inter').text(d => d.kind === 'criterion' ? d.label.slice(0, 26) + (d.label.length > 26 ? '…' : '') : d.label);
@@ -327,6 +349,7 @@ async function loadGraph() {
   });
   sim.force('link').links(glinks);
   sim.alpha(.7).restart();
+  if (pathIds.size) setTimeout(() => highlightPath({nodes: [...pathIds].map(id => ['', id, ''])}), 50);
 }
 
 /* ---------- events ---------- */
@@ -357,6 +380,20 @@ function handle(ev) {
         `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${esc(ev.reply)}</div>`, 'a');
       trace(s, 'ag', `${esc(ev.model)} → ${(ev.ops || []).length} tool calls (${ev.ms}ms)`);
       break;
+    case 'topics': {
+      const ct = crits.find(c => c.id === ev.crit)?.text || ev.crit;
+      trace(s, 'fk', `“${esc(ct)}” → topics ${ev.topics.map(([t, p]) => `${esc(t.split(',')[0])} ${p.toFixed(2)}`).join(' · ')} <span style="color:var(--faint)">(${esc(ev.model)} ${ev.ms}ms, MAPS_TO written ${ev.gms}ms)</span>`);
+      refreshGraph(); break;
+    }
+    case 'graph_search':
+      status(`FalkorDB shortestPath from your criterion: ${ev.hits} reachable`, 1);
+      trace(s, 'fk', `shortestPath → ${ev.hits} reachable (${ev.ms}ms) · direct: ${esc(ev.direct.slice(0, 5).join(', '))}${ev.multihop.length ? ` · via people: <b>${esc(ev.multihop.join(', '))}</b>` : ''}<br><code>${esc(ev.cypher)}</code>`);
+      break;
+    case 'fulltext': trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
+    case 'why':
+      ev.items.forEach(it => why[it.id] = it); render();
+      trace(s, 'fk', `why: shortestPath from you to top ${ev.items.length} (${ev.ms}ms)<br>` + ev.items.map(it => `${esc(E[it.id]?.name)}: ${esc(pathText(it))}`).join('<br>'));
+      highlightPath(ev.items[0]); break;
     case 'tf_session': trace(s, 'ag', `TrueForge session ${esc(ev.id)} (${ev.ms}ms)`); break;
     case 'tf_mcp': trace(s, 'ag', `TrueForge connected MCP: ${esc(ev.servers.join(', '))}`); break;
     case 'tf_tool_call': {
@@ -438,30 +475,45 @@ function handle(ev) {
       break;
     case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
     case 'graph': refreshGraph(); if (ev.op !== 'scored') trace(s, 'fk', `${ev.op} (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); else trace(s, 'fk', `wrote ${ev.n} SCORED edges (${ev.ms}ms)`); break;
+    case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1); tfBox = null;
+      document.querySelectorAll('.cell.gap, .cell.route, .cell.fetch').forEach(() => {});
+      Object.values(cells).forEach(c => { if (['gap', 'route', 'fetch'].includes(c.state)) c.state = 'done'; }); render(); break;
     case 'done': busy = false; status(`done in ${(ev.ms / 1000).toFixed(1)}s`); offerNext(); break;
     case 'error': busy = false; status('error: ' + ev.text); trace(s, 'bd', 'error ' + esc(ev.text)); break;
   }
 }
 
+let ctrl = null;
 async function send(text) {
-  if (busy || !text.trim()) return;
+  if (!text.trim()) return;
+  if (busy && ctrl) { ctrl.abort(); document.querySelector('.a.pending')?.remove(); }
   busy = true; t0 = Date.now() / 1000;
+  if (CLARIFY[text]) { NEXT = [CLARIFY[text], ...NEXT.filter(n => !Object.values(CLARIFY).includes(n))]; nextI = 0; }
   const used = NEXT.indexOf(text); if (used >= nextI) nextI = used + 1;
   document.querySelectorAll('.next').forEach(b => b.remove());
   $('#empty').style.display = 'none';
   chat(esc(text), 'u'); $('#q').value = '';
-  const res = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text})});
+  const mine = ctrl = new AbortController();
+  let res;
+  try { res = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text}), signal: mine.signal}); }
+  catch { return; }
   const rd = res.body.getReader(), dec = new TextDecoder(); let buf = '';
   for (;;) {
-    const {value, done} = await rd.read(); if (done) break;
+    let r; try { r = await rd.read(); } catch { return; }
+    const {value, done} = r; if (done) break;
+    if (mine !== ctrl) return;
     buf += dec.decode(value, {stream: true});
     let i; while ((i = buf.indexOf('\n\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 2); if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6))); }
   }
   busy = false;
 }
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') send(e.target.value); });
-const NEXT = ["Actually, that matters less now. Supply chain security is the priority.", "Which talks should I go to for this?",
-  "It's Wednesday 2pm and I'm at the conference. What now?", "Put my plan in my calendar."];
+const CLARIFY = {
+  "I'm looking for a job.": "No no, I mean companies that are likely hiring, and the people doing the hiring.",
+  "I want to meet interesting people.": "No no, I mean academics and authors.",
+  "I want to keep up with where AI coding is going.": "Specifically agent sandboxes and testing what agents write.",
+};
+let NEXT = ["Which talks should I go to for this?", "It's Wednesday 2pm and I'm at the conference. What now?", "Put my plan in my calendar."];
 let nextI = 0;
 document.addEventListener('click', e => {
   if (e.target.classList.contains('starter') || e.target.classList.contains('next')) send(e.target.textContent);
