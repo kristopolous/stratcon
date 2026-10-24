@@ -110,13 +110,80 @@ async def load_entities():
                        "when": w or "", "room": r or "", "logo": lg or "", "speakers": sp or ""}
 
 
-async def systemone(model: str, state: str, questions: dict) -> tuple[dict, int]:
+# Mirrors storyclass.py: every request declares num_ctx (top level, next to keep_alive), stays inside a
+# per-model character budget (~3.5 chars/token, question scaffold included) and the 64 KiB payload cap,
+# retries 429/5xx with backoff, and on "too large" splits the question batch or halves the state.
+MODEL_NUM_CTX = {"tev1": 2048, "clef-flash": 8192, "nimble": 8192, "nimble-v3": 8192, "clef": 16384, "jev": 16384,
+                 "systemone": 16384}
+MODEL_CHAR_LIMITS = {"tev1": 3500, "clef-flash": 15000, "nimble": 12000, "nimble-v3": 12000, "clef": 20000,
+                     "jev": 20000, "systemone": 20000}
+DEFAULT_NUM_CTX = 8192
+DEFAULT_CHARS = 12000
+MAX_PAYLOAD = 60_000
+MAX_QUESTIONS = 64
+
+
+def _base(model: str) -> str:
+    return model.split(":")[0]
+
+
+def payload_fits(model: str, state: str, questions: dict) -> bool:
+    q = json.dumps(questions)
+    chars = len(state) + len(q)
+    ctx = MODEL_NUM_CTX.get(_base(model), DEFAULT_NUM_CTX)
+    return (len(questions) <= MAX_QUESTIONS and len((state + q).encode()) + 300 < MAX_PAYLOAD
+            and chars <= MODEL_CHAR_LIMITS.get(_base(model), DEFAULT_CHARS) and chars / 3.5 < ctx * 0.9)
+
+
+def _too_large(msg: str) -> bool:
+    m = msg.lower()
+    return "too large" in m or "exceed" in m or "413" in m or "tokens) is too" in m or "batch size" in m
+
+
+async def _post(model: str, state: str, questions: dict) -> dict:
+    body = {"model": model, "state": state, "questions": questions, "keep_alive": "15m",
+            "num_ctx": MODEL_NUM_CTX.get(_base(model), DEFAULT_NUM_CTX)}
+    last = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=180) as c:
+                r = await c.post(config.SYSTEMONE_URL, json=body)
+        except (httpx.TransportError, httpx.TimeoutException) as x:
+            last = f"{type(x).__name__}: {x}"
+            await asyncio.sleep(2 * attempt)
+            continue
+        if r.status_code == 200:
+            return r.json()["answers"]
+        last = f"systemone {model} HTTP {r.status_code}: {r.text[:200]}"
+        if r.status_code == 413 or _too_large(r.text):
+            raise OverflowError(last)
+        if r.status_code == 429 or r.status_code >= 500:
+            await asyncio.sleep(2 * attempt)
+            continue
+        raise RuntimeError(last)
+    raise RuntimeError(last)
+
+
+async def systemone(model: str, state: str, questions: dict, _depth: int = 0) -> tuple[dict, int]:
     t = time.time()
-    async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(config.SYSTEMONE_URL, json={"model": model, "state": state, "questions": questions})
-        if r.status_code != 200:
-            raise RuntimeError(f"systemone {r.status_code}: {r.text[:300]}")
-        return r.json()["answers"], int((time.time() - t) * 1000)
+    try:
+        if not payload_fits(model, state, questions):
+            raise OverflowError("over budget before sending")
+        answers = await _post(model, state, questions)
+    except OverflowError:
+        if _depth >= 4:
+            raise
+        if len(questions) > 1:
+            keys = list(questions)
+            half = len(keys) // 2
+            a1, _ = await systemone(model, state, {k: questions[k] for k in keys[:half]}, _depth + 1)
+            a2, _ = await systemone(model, state, {k: questions[k] for k in keys[half:]}, _depth + 1)
+            answers = {**a1, **a2}
+        elif len(state) > 800:
+            answers, _ = await systemone(model, state[:len(state) // 2] + "\n[... truncated ...]", questions, _depth + 1)
+        else:
+            raise
+    return answers, int((time.time() - t) * 1000)
 
 
 async def warmup():
@@ -427,10 +494,18 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
         keep |= {r[0] for r in rows[:3]}
         yield ev("fulltext", crit=cid, cypher=cy, query=q, ms=ms, hits=[ENTITIES[r[0]]["name"] for r in rows[:3]])
         if len(keep) < 5:
-            opts = {e["id"]: f"{e['name']}: {e['description'][:110]}" for e in ents}
-            a, ms = await systemone(config.ROUTER_MODEL, "GitHub Universe 2026 sponsor booths, talks and people.",
-                                    {"pick": {"type": "choice", "instructions": f"Which one best satisfies: {text}?",
-                                              "criteria": opts}})
+            fstate = "GitHub Universe 2026 sponsor booths, talks and people."
+            finstr = f"Which one best satisfies: {text}?"
+            pool = sorted(ents, key=lambda e: e["kind"] == "talk")
+            opts = {}
+            for e in pool:
+                trial = {**opts, e["id"]: f"{e['name']} ({e['kind']}{', ' + e['org'] if e.get('org') else ''})"}
+                if not payload_fits(config.ROUTER_MODEL, fstate + " " * 200,
+                                    {"pick": {"type": "choice", "instructions": finstr, "criteria": trial}}):
+                    break
+                opts = trial
+            a, ms = await systemone(config.ROUTER_MODEL, fstate,
+                                    {"pick": {"type": "choice", "instructions": finstr, "criteria": opts}})
             probs = sorted(a["pick"]["probabilities"].items(), key=lambda x: -x[1])
             for i, pr in probs:
                 rel[i] += pr
