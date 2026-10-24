@@ -34,7 +34,7 @@ def session(sid: str) -> engine.Session:
 
 @app.get("/")
 async def index():
-    return FileResponse(os.path.join(HERE, "static", "index.html"))
+    return FileResponse(os.path.join(HERE, "static", "index.html"), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/entities")

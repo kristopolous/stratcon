@@ -38,7 +38,8 @@ header span{color:var(--dim);font-size:13px}
 .thinking{font:12px var(--mono);color:var(--faint)}
 .compose{padding:12px;border-top:1px solid var(--line)}
 .sugg{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
-.sugg button{background:none;border:1px dashed #2c3340;color:var(--dim);text-align:left;padding:7px 10px;border-radius:6px;font:12.5px Inter;cursor:pointer}
+.sugg button{background:none;border:1px dashed #2c3340;color:var(--dim);text-align:left;padding:6px 10px;border-radius:6px;font:12px Inter;cursor:pointer}
+.sugg .sg{font:10.5px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
 .sugg button:hover{color:var(--text);border-color:var(--crit)}
 #q{width:100%;background:#0e1116;border:1px solid #2a303b;color:var(--text);padding:11px 12px;border-radius:8px;font:14px Inter;outline:none}
 #q:focus{border-color:var(--crit)}
@@ -57,7 +58,7 @@ header span{color:var(--dim);font-size:13px}
 .row{position:absolute;left:0;right:0;height:var(--rh);padding:0 16px;gap:8px;border-bottom:1px solid #161a21;transition:transform .7s cubic-bezier(.2,.8,.2,1),opacity .5s}
 .row .rk{font:600 13px var(--mono);color:var(--faint)}
 .row.top .rk{color:var(--text)}
-.ent .n{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ent .n{font-weight:600;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ent .m{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ent .why{font-size:11.5px;color:var(--yes);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px}
@@ -124,8 +125,12 @@ header span{color:var(--dim);font-size:13px}
     <div id="log"></div>
     <div class="compose">
       <div class="sugg" id="sugg">
-        <button>Our AI agents keep shipping bugs and our test suite is flaky.</button>
-        <button>Actually, testing matters less. Lock down our software supply chain.</button>
+        <div class="sg">start with</div>
+        <button>Coding agents keep breaking our CI/CD pipelines and builds take forever.</button>
+        <button>We ship AI-written code nobody understands. I need debugging and code comprehension.</button>
+        <button>We need isolated sandboxes to safely run and test what our agents generate.</button>
+        <div class="sg">then</div>
+        <button>Actually, that matters less now. Supply chain security is the priority.</button>
         <button>Which talks should I go to for this?</button>
         <button>It's Wednesday 2pm and I'm at the conference. What now?</button>
         <button>Put my plan in my calendar.</button>
@@ -136,7 +141,7 @@ header span{color:var(--dim);font-size:13px}
 
   <section class="board">
     <div class="thead" id="thead"></div>
-    <div id="rows"><div class="empty" id="empty">Tell it what you're working on.<br>Every sponsor and speaker at GitHub Universe gets scored against what you say.</div></div>
+    <div id="rows"><div class="empty" id="empty">Tell it what you're working on.<br>Every sponsor booth, talk and speaker at GitHub Universe gets scored against what you say.</div></div>
   </section>
 
   <section class="side">
