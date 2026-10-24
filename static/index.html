@@ -310,16 +310,6 @@ $('#rows').addEventListener('click', ev => {
     <div class="sub">source: <a href="${esc(x.evidence.url)}" target="_blank">${esc(x.evidence.url)}</a></div>
     <div class="calls">${(x.calls || []).map(k => `<div>${esc(k.product)} · ${esc(k.target)} · ${(k.ms / 1000).toFixed(1)}s · ${(k.bytes / 1024).toFixed(0)} KB</div>`).join('')}</div>`;
   $('#drawer').classList.add('on');
-  if (e.kind === 'person' || e.kind === 'speaker') {
-    const box = document.createElement('div');
-    box.innerHTML = `<div class="dsec">who is this</div><div class="dl dim">looking them up with Bright Data SERP API…</div>`;
-    $('#dbox').insertBefore(box, $('#dbox').children[2]);
-    const p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
-    box.innerHTML = `<div class="dsec">who is this</div>` +
-      (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
-      (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
-      (p.cached ? `<div class="dl dim">from graph memory (FalkorDB)</div>` : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s · ${Math.round((q.bytes || 0) / 1024)} KB</div>`).join('') + `<div class="dl dim">saved to graph</div>`);
-  }
 });
 $('#drawer').addEventListener('click', e => {
   if (e.target.id === 'drawer') e.currentTarget.classList.remove('on');
