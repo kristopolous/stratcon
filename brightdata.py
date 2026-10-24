@@ -108,3 +108,27 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
     return {"product": "Browser API", "strategy": "render_browser", "target": url, "status": 200,
             "bytes": len(text.encode()), "ms": int((time.time() - t) * 1000), "text": text, "links": links,
             "images": images}
+
+
+LINKEDIN_PEOPLE = "gd_l1viktl72bvl7bjuj0"
+
+
+async def dataset_trigger(dataset_id: str, inputs: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(f"{API}/datasets/v3/trigger", params={"dataset_id": dataset_id, "format": "json"},
+                         headers=HDR, json=inputs)
+        r.raise_for_status()
+        return r.json()["snapshot_id"]
+
+
+async def snapshot_progress(snapshot_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(f"{API}/datasets/v3/progress/{snapshot_id}", headers=HDR)
+        return r.json()
+
+
+async def snapshot_download(snapshot_id: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.get(f"{API}/datasets/v3/snapshot/{snapshot_id}", params={"format": "json"}, headers=HDR)
+        data = r.json()
+        return data if isinstance(data, list) else [data]

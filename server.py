@@ -182,14 +182,27 @@ async def enrich(id: str):
     e = engine.ENTITIES.get(id)
     if not e or e["kind"] not in ("person", "speaker"):
         return JSONResponse({"error": "not a person"}, status_code=400)
-    rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials", {"id": id})
+    rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials, p.li_profile, "
+                              "p.li_snapshot, p.li_ms", {"id": id})
     if rows and (rows[0][0] or rows[0][3]):
-        return JSONResponse({"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
-                             "other": json.loads(rows[0][3]) if rows[0][3] else []})
+        out = {"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
+               "other": json.loads(rows[0][3]) if rows[0][3] else []}
+        if rows[0][4]:
+            out["scraper"] = {"product": "Web Scraper API · LinkedIn people profiles", "status": "ready", "cached": True,
+                              "snapshot": rows[0][5], "ms": rows[0][6], "profile": json.loads(rows[0][4])}
+        elif out["linkedin"]:
+            out["scraper"] = await _linkedin(id, out["linkedin"])
+        return JSONResponse(out)
     q1 = f"\"{e['name']}\" {e.get('org', '')} linkedin"
     q2 = f"\"{e['name']}\" (site:github.com OR site:x.com OR site:bsky.app OR site:mastodon.social)"
     r1, r2 = await asyncio.gather(brightdata.serp(q1), brightdata.serp(q2))
     hit = next((x for x in r1["results"] if "linkedin.com/in/" in x["link"]), None)
+    if not hit:
+        q3 = f"site:linkedin.com/in \"{e['name']}\" {e.get('org', '')}"
+        r3 = await brightdata.serp(q3)
+        hit = next((x for x in r3["results"] if "linkedin.com/in/" in x["link"]), None)
+        r1 = {**r1, "ms": r1["ms"] + r3["ms"]}
+        q1 = q1 + "  →  " + q3
     last = e["name"].split()[-1].lower()
     socials = [x for x in r2["results"] if last in (x["title"] + x["link"] + x["description"]).lower()][:3]
     out = {"queries": [{"q": q1, "ms": r1["ms"], "bytes": r1["bytes"]}, {"q": q2, "ms": r2["ms"], "bytes": r2["bytes"]}],
@@ -200,7 +213,41 @@ async def enrich(id: str):
         await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
                         {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
                          "ms": max(r1["ms"], r2["ms"])})
+    if hit:
+        out["scraper"] = await _linkedin(id, hit["link"].split("?")[0])
     return JSONResponse(out)
+
+
+LI_JOBS: dict[str, dict] = {}
+
+
+async def _linkedin(id: str, url: str) -> dict:
+    """Bright Data Web Scraper API, LinkedIn people profiles: trigger once, then report progress until ready."""
+    import time as _t
+    import brightdata
+    job = LI_JOBS.get(id)
+    if not job:
+        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
+        job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
+    if job["status"] == "running":
+        prog = await brightdata.snapshot_progress(job["snapshot"])
+        job["status"] = {"ready": "ready", "failed": "failed"}.get(prog.get("status"), "running")
+        if job["status"] == "ready":
+            rec = (await brightdata.snapshot_download(job["snapshot"]))[0]
+            photo = "" if rec.get("default_avatar") else (rec.get("avatar") or "")
+            comp = rec.get("current_company") or {}
+            job["profile"] = {"name": rec.get("name"), "photo": photo, "about": (rec.get("about") or "")[:400],
+                              "company": comp.get("name") if isinstance(comp, dict) else rec.get("current_company_name"),
+                              "city": rec.get("city"), "followers": rec.get("followers"), "url": rec.get("url") or url,
+                              "position": rec.get("position")}
+            job["ms"] = int((_t.time() - job["started"]) * 1000)
+            await engine.gq("MATCH (p {id:$id}) SET p.li_profile=$j, p.photo=$ph, p.li_snapshot=$sid, p.li_ms=$ms",
+                            {"id": id, "j": json.dumps(job["profile"]), "ph": photo, "sid": job["snapshot"], "ms": job["ms"]})
+            if photo and id in engine.ENTITIES:
+                engine.ENTITIES[id]["logo"] = photo
+    return {"product": "Web Scraper API · LinkedIn people profiles", "dataset": "gd_l1viktl72bvl7bjuj0",
+            "snapshot": job["snapshot"], "status": job["status"], "elapsed": int(_t.time() - job["started"]),
+            "profile": job.get("profile"), "ms": job.get("ms")}
 
 
 @app.get("/api/calendar.ics")
