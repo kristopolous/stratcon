@@ -55,18 +55,39 @@ async def _ws() -> str:
     return _browser_ws
 
 
-async def browser(url: str, scroll: int = 2, links_text: str | None = None) -> dict:
+async def browser(url: str, scroll: int = 2, links_text: str | None = None,
+                  click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
     t = time.time()
     links, images = [], []
     async with async_playwright() as p:
         b = await p.chromium.connect_over_cdp(await _ws())
         try:
             page = await b.new_page()
-            await page.goto(url, timeout=120000)
-            await page.wait_for_timeout(5000)
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            if wait_text:
+                await page.get_by_text(wait_text, exact=True).first.wait_for(timeout=60000)
+                await page.wait_for_timeout(1500)
+            else:
+                await page.wait_for_timeout(9000)
             for _ in range(scroll):
                 await page.mouse.wheel(0, 4000)
                 await page.wait_for_timeout(800)
+            items = page.get_by_text(wait_text, exact=True) if wait_text else None
+            for _ in range(clicks):
+                more = page.get_by_text(click_text, exact=True).first
+                if not await more.count():
+                    break
+                before = await items.count() if items else 0
+                for _try in range(3):
+                    await more.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(800)
+                    await more.click(force=True)
+                    for _w in range(20):
+                        await page.wait_for_timeout(500)
+                        if not items or await items.count() > before:
+                            break
+                    if not items or await items.count() > before:
+                        break
             text = await page.inner_text("body")
             if links_text:
                 links = await page.eval_on_selector_all(

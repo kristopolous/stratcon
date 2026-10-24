@@ -81,6 +81,24 @@ async def graph(sid: str):
     return JSONResponse({"nodes": list(nodes.values()), "links": list(uniq.values()), "cypher": cy, "ms": ms})
 
 
+@app.get("/api/calendar.ics")
+async def calendar(sid: str):
+    from fastapi.responses import Response
+    s = session(sid)
+    fmt = "%Y%m%dT%H%M%S"
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//StratCon//GitHub Universe 2026//EN", "CALSCALE:GREGORIAN"]
+    for i, item in enumerate(engine.plan(s)):
+        esc = lambda t: t.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", " ")
+        lines += ["BEGIN:VEVENT", f"UID:stratcon-{sid}-{i}@stratcon", f"DTSTAMP:{engine.datetime.utcnow().strftime(fmt)}Z",
+                  f"DTSTART;TZID=America/Los_Angeles:{item['start'].strftime(fmt)}",
+                  f"DTEND;TZID=America/Los_Angeles:{item['end'].strftime(fmt)}",
+                  f"SUMMARY:{esc(item['title'])}", f"LOCATION:{esc(item['where'])}",
+                  f"DESCRIPTION:{esc(item['why'][:300])}", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return Response("\r\n".join(lines) + "\r\n", media_type="text/calendar",
+                    headers={"Content-Disposition": "attachment; filename=stratcon-universe-2026.ics"})
+
+
 @app.post("/api/reset")
 async def reset(req: Request):
     sid = (await req.json())["sid"]

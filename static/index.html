@@ -118,7 +118,7 @@ header span{color:var(--dim);font-size:13px}
 </head>
 <body>
 <div class="app">
-  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span></header>
+  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span></header>
 
   <section class="chat">
     <div id="log"></div>
@@ -126,8 +126,9 @@ header span{color:var(--dim);font-size:13px}
       <div class="sugg" id="sugg">
         <button>Our AI agents keep shipping bugs and our test suite is flaky.</button>
         <button>Actually, testing matters less. Lock down our software supply chain.</button>
-        <button>Bring flaky tests back too, but skip the consultancies.</button>
-        <button>Which speakers should I go hear about this?</button>
+        <button>Which talks should I go to for this?</button>
+        <button>It's Wednesday 2pm and I'm at the conference. What now?</button>
+        <button>Put my plan in my calendar.</button>
       </div>
       <input id="q" placeholder="What are you here for?" autocomplete="off">
     </div>
@@ -159,8 +160,8 @@ const STRAT = {web_search: 'search', read_site: 'read site', render_browser: 're
 
 fetch('/api/entities').then(r => r.json()).then(list => {
   list.forEach(e => E[e.id] = e);
-  const sp = list.filter(e => e.kind === 'sponsor').length, sk = list.length - sp;
-  $('#meta').textContent = `GitHub Universe 2026 · ${sp} sponsors · ${sk} featured speakers`;
+  const n = k => list.filter(e => e.kind === k).length;
+  $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker')} featured speakers`;
 });
 
 function status(t, b) { $('#status').textContent = t; $('#status').classList.toggle('busy', !!b); }
@@ -302,6 +303,8 @@ function handle(ev) {
         o.op === 'add' ? `<div class="tool"><span class="fn">add_criterion</span>("${esc(o.text)}", ${o.weight})</div>` :
         o.op === 'remove' ? `<div class="tool rm"><span class="fn">remove_criterion</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}")</div>` :
         o.op === 'reweight' ? `<div class="tool rw"><span class="fn">reweight</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}", ${crits.find(c => c.id === o.id)?.weight} → ${o.weight})</div>` :
+        o.op === 'clock' ? `<div class="tool rw"><span class="fn">set_clock</span>("${esc(o.value)}")</div>` :
+        o.op === 'calendar' ? `<div class="tool"><span class="fn">export_calendar</span>()</div>` :
         `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${esc(ev.reply)}</div>`, 'a');
       trace(s, 'ag', `${esc(ev.model)} → ${(ev.ops || []).length} tool calls (${ev.ms}ms)`);
       break;
@@ -323,6 +326,16 @@ function handle(ev) {
       trace(s, 'ag', `tool.response ${esc(ev.content.slice(0, 120))}`);
       break;
     }
+    case 'clock':
+      $('#clock').textContent = `conference clock: ${ev.label}`;
+      trace(s, 'ag', `clock → ${esc(ev.label)} · ${ev.hidden} talks already happened, dropped from the plan`);
+      status(`it's ${ev.label}: ${ev.hidden} talks are over, re-planning around what's left`, 1);
+      break;
+    case 'calendar':
+      chat(`<div class="tool" style="border-left-color:var(--yes)"><span class="fn" style="color:var(--yes)">export_calendar</span>() → <a href="${esc(ev.url)}" style="color:#7aa2ff">stratcon-universe-2026.ics</a></div>` +
+        ev.items.map(i => `<div class="reply">${esc(i.start)} · ${esc(i.title)}${i.where ? ' · ' + esc(i.where) : ''}</div>`).join(''), 'a');
+      trace(s, 'ag', `calendar: ${ev.items.length} events`);
+      break;
     case 'rubric': crits = ev.criteria; renderHead(); render(); break;
     case 'reweight': trace(s, 'ag', `reweight ${esc(ev.crit)} ${ev.before} → ${ev.after}`); break;
     case 'rank': rank = ev.rows; render(); break;
@@ -359,7 +372,7 @@ function handle(ev) {
       trace(s, 'bd', `route ${esc(E[ev.e]?.name)} → <b>${STRAT[ev.chosen]}</b> ${Object.entries(ev.probs).map(([k, v]) => `${STRAT[k]} ${v.toFixed(2)}`).join(' · ')} (${ev.model}, ${ev.ms}ms)`);
       break;
     case 'fetch': {
-      const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `google: ${ev.target}`) :
+      const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `SERP API: ${ev.target}`) :
         ev.product === 'Web Unlocker' ? `reading ${host(ev.target)}` : `rendering ${host(ev.target)} in browser`;
       setTimeout(() => { setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
       trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(`${ev.product}: ${ev.target}`, 1);

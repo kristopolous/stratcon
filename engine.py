@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime, timedelta
 
 import httpx
 from falkordb import FalkorDB
@@ -36,10 +37,53 @@ def slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48]
 
 
+def _reconnect():
+    global graph
+    graph = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+
+
 async def gq(cypher: str, params: dict | None = None):
     t = time.time()
-    res = await asyncio.to_thread(graph.query, cypher, params or {})
+    try:
+        res = await asyncio.to_thread(graph.query, cypher, params or {})
+    except Exception as x:
+        if "pipe" not in str(x).lower() and "connection" not in str(x).lower() and "closed" not in str(x).lower():
+            raise
+        await asyncio.to_thread(_reconnect)
+        res = await asyncio.to_thread(graph.query, cypher, params or {})
     return res.result_set, int((time.time() - t) * 1000)
+
+
+def talk_window(e: dict):
+    m = re.match(r"\w+, Oct (\d+) · (\d{1,2}:\d{2} [AP]M) - (\d{1,2}:\d{2} [AP]M)", e.get("when") or "")
+    if not m:
+        return None
+    day = int(m.group(1))
+    start = datetime.strptime(f"2026-10-{day:02d} {m.group(2)}", "%Y-%m-%d %I:%M %p")
+    end = datetime.strptime(f"2026-10-{day:02d} {m.group(3)}", "%Y-%m-%d %I:%M %p")
+    return start, end
+
+
+def plan(session: "Session", talks: int = 6, booths: int = 4) -> list[dict]:
+    """Greedy non-overlapping schedule from the current ranking, plus one expo-hall block for top booths."""
+    ranking = [r for r in session.ranking(everything=True) if r["score"] > 0.2]
+    chosen = []
+    for r in ranking:
+        e = ENTITIES[r["id"]]
+        w = talk_window(e) if e["kind"] == "talk" else None
+        if w and all(w[1] <= c["start"] or w[0] >= c["end"] for c in chosen) and len(chosen) < talks:
+            chosen.append({"title": e["name"], "start": w[0], "end": w[1], "where": e.get("room", ""),
+                           "why": e.get("speakers", ""), "score": r["score"]})
+    top_booths = [ENTITIES[r["id"]] for r in ranking if ENTITIES[r["id"]]["kind"] == "sponsor"][:booths]
+    if top_booths:
+        slot = max(datetime(2026, 10, 28, 10, 0), session.now or datetime.min)
+        slot = slot.replace(minute=(slot.minute // 15) * 15, second=0, microsecond=0)
+        while any(not (slot + timedelta(minutes=45) <= c["start"] or slot >= c["end"]) for c in chosen):
+            slot += timedelta(minutes=15)
+        chosen.append({"title": "Expo hall: " + ", ".join(b["name"] for b in top_booths), "start": slot,
+                       "end": slot + timedelta(minutes=45), "where": "Partner booths, Fort Mason Center",
+                       "why": "; ".join(f"{b['name']}: {b['description'][:80]}" for b in top_booths), "score": 0})
+    return sorted(chosen, key=lambda c: c["start"])
 
 
 def ev(type_: str, **kw) -> dict:
@@ -51,10 +95,12 @@ ACTIVE = None
 
 
 async def load_entities():
-    rows, _ = await gq("MATCH (e:Entity) RETURN e.id, e.kind, e.name, e.tier, e.description, e.url, e.org")
+    rows, _ = await gq("MATCH (e:Entity) RETURN e.id, e.kind, e.name, e.tier, e.description, e.url, e.org, "
+                       "e.when, e.room, e.logo, e.speakers")
     ENTITIES.clear()
-    for i, k, n, t, d, u, o in rows:
-        ENTITIES[i] = {"id": i, "kind": k, "name": n, "tier": t, "description": d, "url": u or "", "org": o or ""}
+    for i, k, n, t, d, u, o, w, r, lg, sp in rows:
+        ENTITIES[i] = {"id": i, "kind": k, "name": n, "tier": t, "description": d, "url": u or "", "org": o or "",
+                       "when": w or "", "room": r or "", "logo": lg or "", "speakers": sp or ""}
 
 
 async def systemone(model: str, state: str, questions: dict) -> tuple[dict, int]:
@@ -88,12 +134,20 @@ class Session:
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.ops: list[dict] = []
         self.tf_id: str | None = None
+        self.now: datetime | None = None
 
-    def entities(self):
+    def entities(self, everything: bool = False):
+        pool = ENTITIES.values() if everything else self._scoped()
+        return [e for e in pool if not (self.now and e["kind"] == "talk" and talk_window(e)
+                                        and talk_window(e)[0] < self.now)]
+
+    def _scoped(self):
         if self.scope == "sponsors":
             return [e for e in ENTITIES.values() if e["kind"] == "sponsor"]
         if self.scope == "speakers":
             return [e for e in ENTITIES.values() if e["kind"] == "speaker"]
+        if self.scope == "talks":
+            return [e for e in ENTITIES.values() if e["kind"] == "talk"]
         return list(ENTITIES.values())
 
     def score(self, eid: str) -> float:
@@ -105,13 +159,13 @@ class Session:
                 s += c["weight"] * cell["p"]
         return s / pos
 
-    def ranking(self):
-        rows = [{"id": e["id"], "score": round(self.score(e["id"]), 4)} for e in self.entities()]
+    def ranking(self, everything: bool = False):
+        rows = [{"id": e["id"], "score": round(self.score(e["id"]), 4)} for e in self.entities(everything)]
         return sorted(rows, key=lambda r: -r["score"])
 
 
 AGENT_PROMPT = """You maintain the recommendation rubric for one attendee of GitHub Universe 2026 \
-(54 expo-hall sponsors plus featured speakers). The rubric is a short list of criteria. Each criterion is a \
+(54 expo-hall sponsor booths, 157 talks and sessions, and featured speakers). The rubric is a short list of criteria. Each criterion is a \
 yes/no-checkable statement about a sponsor or speaker, e.g. "Helps automatically test web apps". \
 Weight 0.1 to 1.0 says how much it matters; use a negative weight (-1.0 to -0.1) for things to avoid.
 
@@ -121,8 +175,12 @@ ops are any of:
   {"op":"add","text":"<criterion>","weight":0.7}
   {"op":"remove","id":"<criterion id>"}
   {"op":"reweight","id":"<criterion id>","weight":0.9}
-  {"op":"scope","value":"all" | "sponsors" | "speakers"}
-Rules: at most 5 criteria in total. When the attendee changes their mind, edit existing criteria instead of \
+  {"op":"scope","value":"all" | "sponsors" | "speakers" | "talks"}
+  {"op":"clock","value":"2026-10-28T14:00"}   (when the attendee says what day/time it is at the conference; \
+the conference runs Oct 28-29, 2026)
+  {"op":"calendar"}   (when the attendee asks to export, save or add their plan to a calendar)
+Rules: at most 5 criteria in total. "Which talks/sessions" means scope talks; "which booths/sponsors" means \
+scope sponsors; "which speakers" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
 piling on: "matters less" / "more important" means reweight; "forget" / "drop" / "no longer" means remove. \
 If they bring back something from earlier in the conversation, add it back with the same wording as before. Phrase each criterion concretely in 8 words or fewer so it can be checked against a company description."""
 
@@ -148,7 +206,9 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
 
 
 TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubric only through the stratcon tools: \
-add_criterion, reweight, remove_criterion, set_scope (call get_rubric if you need criterion ids). Make every edit \
+add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
+conference, Oct 28-29 2026), export_calendar (when they want their plan in a calendar); call get_rubric if you \
+need criterion ids. Make every edit \
 the attendee's message implies, then reply with one short sentence. Rules: at most 5 criteria. "matters less" / \
 "more important" means reweight; "forget" / "drop" / "no longer" means remove. If they bring back something from \
 earlier, add it back with the same wording as before. Phrase each criterion in 8 words or fewer."""
@@ -247,8 +307,20 @@ async def apply_ops(session: Session, ops: list[dict]):
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) SET r.weight=$w"
             _, ms = await gq(cy, {"sid": session.sid, "cid": cid, "w": w})
             events.append(ev("graph", op="reweight", cypher=cy, ms=ms, crit=cid))
-        elif kind == "scope" and op.get("value") in ("all", "sponsors", "speakers"):
+        elif kind == "scope" and op.get("value") in ("all", "sponsors", "speakers", "talks"):
             session.scope = op["value"]
+        elif kind == "clock" and op.get("value"):
+            try:
+                session.now = datetime.fromisoformat(str(op["value"])[:16])
+                events.append(ev("clock", now=session.now.isoformat(), label=session.now.strftime("%a %b %d, %-I:%M %p"),
+                                 hidden=sum(1 for e in session._scoped() if e not in session.entities())))
+            except ValueError:
+                pass
+        elif kind == "calendar":
+            items = plan(session)
+            events.append(ev("calendar", url=f"/api/calendar.ics?sid={session.sid}",
+                             items=[{"title": i["title"], "start": i["start"].strftime("%a %-I:%M %p"),
+                                     "where": i["where"]} for i in items]))
     return events
 
 
@@ -280,13 +352,15 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
     for cid in crits:
         text = session.criteria[cid]["text"]
         yield ev("retrieval", crit=cid, model=config.ROUTER_MODEL, phase="start", n=len(opts))
-        a, ms = await systemone(config.ROUTER_MODEL, "GitHub Universe 2026 expo hall sponsors and featured speakers.",
+        a, ms = await systemone(config.ROUTER_MODEL, "GitHub Universe 2026 sponsor booths, talks and featured speakers.",
                                 {"pick": {"type": "choice", "instructions": f"Which one best satisfies: {text}?",
                                           "criteria": opts}})
         probs = sorted(a["pick"]["probabilities"].items(), key=lambda x: -x[1])
         for i, pr in probs:
             rel[i] += pr
         keep |= {i for i, _ in probs[:RETRIEVE_PER_CRIT]}
+        for kind in ("sponsor", "talk", "speaker"):
+            keep |= {i for i, _ in [x for x in probs if ENTITIES[x[0]]["kind"] == kind][:2]}
         yield ev("retrieval", crit=cid, model=config.ROUTER_MODEL, phase="done", ms=ms, n=len(opts),
                  top=[[ENTITIES[i]["name"], round(pr, 3)] for i, pr in probs[:6]])
     keep |= {r["id"] for r in session.ranking()[:TOP_FOR_GAPS] if r["score"] > 0}
@@ -371,6 +445,8 @@ async def route(session: Session, gaps: list[dict]):
         avail = [s for s in STRATEGIES if s not in [t["strategy"] for t in tried]]
         if e["kind"] == "speaker":
             avail = [s for s in avail if s in ("web_search", "people_search")]
+        elif e["kind"] == "talk":
+            avail = [s for s in avail if s == "web_search"]
         else:
             avail = [s for s in avail if s != "people_search"]
             if not any(t["strategy"] == "read_site" for t in tried):
@@ -534,11 +610,8 @@ async def turn(session: Session, text: str):
     active = list(session.criteria)
     added = [c for c in active if c not in before]
     if session.scope != scope_before and not added and active:
-        todo = [e for e in session.entities() if any((e["id"], c) not in session.cells for c in active)]
-        if todo:
-            yield ev("candidates", total=len(session.entities()), kept=len(todo), names=[e["name"] for e in todo])
-            async for e in score_new(session, active, only=todo):
-                yield e
+        async for e in score_new(session, active):
+            yield e
     if added:
         cells, have, cy, ms = await recall(session, added)
         if cells:
@@ -566,6 +639,8 @@ async def turn(session: Session, text: str):
         if row["score"] <= 0:
             continue
         e = ENTITIES[row["id"]]
+        if e["kind"] == "talk":
+            continue
         thin = e["kind"] == "speaker" or len(e["description"]) < 90
         for cid, c in session.criteria.items():
             cell = session.cells.get((row["id"], cid))

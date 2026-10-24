@@ -57,8 +57,23 @@ async def reweight(criterion_id: str, weight: float) -> str:
 
 @mcp.tool()
 async def set_scope(scope: str) -> str:
-    """Restrict recommendations to 'all', 'sponsors' or 'speakers'."""
+    """Restrict recommendations to 'all', 'sponsors', 'speakers' or 'talks'."""
     return await _apply({"op": "scope", "value": scope})
+
+
+@mcp.tool()
+async def set_clock(iso_datetime: str) -> str:
+    """Set the current time at the conference (e.g. 2026-10-28T14:00) so past talks drop out and the plan updates."""
+    return await _apply({"op": "clock", "value": iso_datetime})
+
+
+@mcp.tool()
+async def export_calendar() -> str:
+    """Build the attendee's plan (best non-overlapping talks plus an expo-hall block) as a downloadable .ics calendar."""
+    out = await _apply({"op": "calendar"})
+    s = engine.ACTIVE
+    url = (config.PUBLIC_URL.rstrip("/") if config.PUBLIC_URL else "") + f"/api/calendar.ics?sid={s.sid if s else ''}"
+    return json.dumps({"calendar_url": url, "result": json.loads(out) if out.startswith("{") else out})
 
 
 class TokenGuard(BaseHTTPMiddleware):
