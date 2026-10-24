@@ -250,6 +250,60 @@ async def _linkedin(id: str, url: str) -> dict:
             "profile": job.get("profile"), "ms": job.get("ms")}
 
 
+@app.get("/api/topic")
+async def topic(sid: str, id: str):
+    cy = ("MATCH (t:Topic {id:$id})-[c:COVERS]->(e:Entity) "
+          "RETURN t.name, e.id, e.name, e.kind, c.p ORDER BY c.p DESC LIMIT 40")
+    rows, ms = await engine.gq(cy, {"id": id})
+    s = session(sid)
+    scores = {r["id"]: r["score"] for r in s.ranking(everything=True)}
+    return JSONResponse({"name": rows[0][0] if rows else id, "cypher": cy, "ms": ms,
+                         "entities": [{"id": i, "name": n, "kind": k, "p": p, "score": scores.get(i, 0)} for _, i, n, k, p in rows]})
+
+
+@app.get("/api/criterion")
+async def criterion(sid: str, id: str):
+    s = session(sid)
+    c = s.criteria.get(id)
+    cy = "MATCH (c:Criterion {id:$id})-[m:MAPS_TO]->(t:Topic) RETURN t.id, t.name, m.p ORDER BY m.p DESC"
+    rows, ms = await engine.gq(cy, {"id": id})
+    best = sorted(((eid, cell["p"]) for (eid, cid), cell in s.cells.items() if cid == id), key=lambda x: -x[1])[:15]
+    return JSONResponse({"text": c["text"] if c else id, "weight": c["weight"] if c else None, "cypher": cy, "ms": ms,
+                         "topics": [{"id": t, "name": n, "p": p} for t, n, p in rows],
+                         "best": [{"id": e, "name": engine.ENTITIES[e]["name"], "kind": engine.ENTITIES[e]["kind"], "p": p}
+                                  for e, p in best if e in engine.ENTITIES]})
+
+
+@app.get("/api/sessions")
+async def sessions_list():
+    cy = ("MATCH (u:User) WHERE u.title IS NOT NULL OPTIONAL MATCH (u)-[:WANTS]->(c:Criterion) "
+          "OPTIONAL MATCH (t:Turn)-[:IN]->(u) "
+          "RETURN u.id, u.title, u.updated, count(DISTINCT c), count(DISTINCT t) ORDER BY u.updated DESC LIMIT 15")
+    rows, ms = await engine.gq(cy)
+    return JSONResponse({"cypher": cy, "ms": ms, "sessions": [
+        {"id": i, "title": t, "updated": u, "criteria": nc, "turns": nt} for i, t, u, nc, nt in rows if nt]})
+
+
+@app.get("/api/session/load")
+async def session_load(sid: str):
+    """Rebuild a past session entirely from the graph: no agent, no decision model, no fetches."""
+    s = engine.Session(sid)
+    sessions[sid] = s
+    cy1 = "MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) RETURN u.scope, u.pins, c.id, c.text, w.weight"
+    rows, ms1 = await engine.gq(cy1, {"sid": sid})
+    for scope, pins, cid, text, w in rows:
+        s.scope = scope or "all"
+        s.pins = [p for p in (pins or []) if p in engine.ENTITIES]
+        if cid:
+            s.criteria[cid] = {"id": cid, "text": text, "weight": w}
+    cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
+    cy3 = "MATCH (t:Turn)-[:IN]->(:User {id:$sid}) RETURN t.text, t.reply ORDER BY t.at"
+    turns, ms3 = await engine.gq(cy3, {"sid": sid})
+    return JSONResponse({"sid": sid, "criteria": list(s.criteria.values()), "scope": s.scope, "pins": s.pins,
+                         "cells": cells, "rows": s.ranking(), "turns": [{"text": a, "reply": b} for a, b in turns],
+                         "queries": [{"cypher": c, "ms": m} for c, m in ((cy1, ms1), (cy2, ms2), (cy3, ms3)) if c]})
+
+
 @app.get("/api/calendar.ics")
 async def calendar(sid: str):
     from fastapi.responses import Response

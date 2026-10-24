@@ -20,6 +20,8 @@ body{background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,sans-
 header{grid-column:1/4;display:flex;align-items:center;gap:16px;padding:0 18px;border-bottom:1px solid var(--line)}
 header b{font-size:16px;letter-spacing:.02em}
 header span{color:var(--dim);font-size:13px}
+#histbtn{background:none;border:1px solid #2a303b;color:var(--dim);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer;margin-right:8px}
+#histbtn:hover{color:var(--text);border-color:var(--crit)}
 #calbtn{background:#152019;border:1px solid #2f6b52;color:var(--yes);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer}
 #calbtn:disabled{opacity:.35;cursor:default}
 #calbtn:not(:disabled):hover{border-color:var(--yes)}
@@ -158,7 +160,7 @@ header span{color:var(--dim);font-size:13px}
 </head>
 <body>
 <div class="app">
-  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span><button id="calbtn" disabled title="TrueForge agent calls the export_calendar MCP tool">Export plan to calendar (.ics)</button></header>
+  <header><b>StratCon</b><span id="meta">GitHub Universe 2026</span><span id="clock" style="margin-left:auto;font:12px var(--mono);color:var(--gap)"></span><button id="histbtn" title="Resume a previous session from the graph">History</button><button id="calbtn" disabled title="TrueForge agent calls the export_calendar MCP tool">Export plan to calendar (.ics)</button></header>
 
   <section class="chat">
     <div id="log"></div>
@@ -181,7 +183,7 @@ header span{color:var(--dim);font-size:13px}
   </section>
 
   <section class="side">
-    <div id="graph"><div class="cap" id="gcap">graph</div></div>
+    <div id="graph"><div class="cap" id="gcap">graph</div><div class="cap" style="top:auto;bottom:8px">click a criterion or topic to explore · scroll to zoom · drag to move</div></div>
     <div id="trace"></div>
   </section>
 
@@ -192,7 +194,7 @@ header span{color:var(--dim);font-size:13px}
 <script>
 const RH = 66, SHOW = 12;
 document.documentElement.style.setProperty('--rh', RH + 'px');
-const sid = 's' + Math.random().toString(36).slice(2, 9);
+let sid = 's' + Math.random().toString(36).slice(2, 9);
 const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0, tfBox = null; const pins = new Set();
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -293,6 +295,7 @@ function doRender() {
     el.style.gridTemplateColumns = cols();
     el.style.transform = `translateY(${i * RH}px)`;
     el.classList.toggle('pinned', pins.has(r.id));
+    el.style.opacity = focusSet && !focusSet.has(r.id) && !pins.has(r.id) ? .3 : 1;
     el.innerHTML = `<div class="rk"><span class="pin" data-pin="${esc(r.id)}" title="pin: keep this on the board">${pins.has(r.id) ? '●' : '○'}</span>${i + 1}</div>
       <div class="ent">${e.logo ? `<img class="logo ${e.kind === 'speaker' ? 'person' : ''}" src="${esc(e.logo)}" alt="" loading="lazy">` : ''}<div class="txt"><div class="n"><span class="dot" style="background:${e.kind === 'speaker' || e.kind === 'person' ? 'var(--speaker)' : e.kind === 'talk' ? 'var(--crit)' : 'var(--sponsor)'}"></span>${esc(e.name)}</div>
       ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · featured speaker' : e.kind === 'person' ? (e.tier ? e.tier + ' · ' : '') + e.org : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
@@ -317,6 +320,8 @@ $('#rows').addEventListener('click', ev => {
 $('#drawer').addEventListener('click', e => {
   if (e.target.id === 'drawer') e.currentTarget.classList.remove('on');
   const r = e.target.closest('[data-open]'); if (r) openEntity(r.dataset.open);
+  const tp = e.target.closest('[data-topic]'); if (tp) { focusNode('t:' + tp.dataset.topic); openTopic(tp.dataset.topic); }
+  const ss = e.target.closest('[data-session]'); if (ss) loadSession(ss.dataset.session);
 });
 async function openEntity(id) {
   const d = await (await fetch(`/api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
@@ -369,9 +374,43 @@ const svg = d3.select('#graph').append('svg');
 const gz = svg.append('g'), gl = gz.append('g'), gn = gz.append('g');
 svg.call(d3.zoom().scaleExtent([0.3, 5]).on('zoom', e => gz.attr('transform', e.transform)));
 const sim = d3.forceSimulation().force('link', d3.forceLink().id(d => d.id).distance(l => l.kind === 'evidence' ? 28 : l.kind === 'wants' ? 70 : 60))
-  .force('charge', d3.forceManyBody().strength(-160)).force('collide', d3.forceCollide(16)).alphaDecay(.03);
+  .force('charge', d3.forceManyBody().strength(-160)).force('collide', d3.forceCollide(16)).alphaDecay(.06).velocityDecay(.55);
 let gnodes = [], glinks = [], gtimer = 0;
 const color = k => ({user: '#fff', criterion: 'var(--crit)', topic: '#7aa2ff', person: '#9aa3b2', sponsor: 'var(--sponsor)', speaker: 'var(--speaker)', talk: '#c4b5fd', evidence: '#ddd'}[k] || '#888');
+let focusSet = null;
+function focusNode(id, rowIds) {
+  const near = new Set([id]);
+  glinks.forEach(l => { const a = l.source.id || l.source, b = l.target.id || l.target; if (a === id) near.add(b); if (b === id) near.add(a); });
+  focusSet = rowIds ? new Set([...near, ...rowIds]) : near;
+  gn.selectAll('g').attr('opacity', d => near.has(d.id) ? 1 : .15);
+  gl.selectAll('line').attr('stroke-opacity', d => near.has(d.source.id) && near.has(d.target.id) ? 1 : .08);
+  render();
+}
+function clearFocus() {
+  focusSet = null;
+  gn.selectAll('g').attr('opacity', 1); gl.selectAll('line').attr('stroke-opacity', .8);
+  render();
+}
+svg.on('click', () => clearFocus());
+async function openCriterion(id) {
+  const d = await (await fetch(`/api/criterion?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  focusSet = new Set([...(focusSet || []), ...d.best.filter(b => b.p >= .5).map(b => b.id)]); render();
+  $('#dbox').innerHTML = `<h3>“${esc(d.text)}”</h3><div class="sub">criterion · weight ${d.weight}</div>
+    <div class="dsec">maps to topics (FalkorDB MAPS_TO)</div>${d.topics.map(t => `<div class="dl link" data-topic="${esc(t.id)}">${esc(t.name)} <span class="dim">${t.p.toFixed(2)}</span></div>`).join('') || '<div class="dl dim">none</div>'}
+    <div class="dsec">best matches (System One scores)</div>${d.best.map(b => `<div class="dl link" data-open="${esc(b.id)}"><b style="font-family:var(--mono);color:${b.p >= .6 ? 'var(--yes)' : 'var(--dim)'}">${b.p.toFixed(2)}</b> ${esc(b.name)} <span class="dim">${esc(b.kind)}</span></div>`).join('')}
+    <div class="dsec">FalkorDB query</div><div class="dl"><code style="font:11px var(--mono);color:#9fb0c8">${esc(d.cypher)}</code> <span class="dim">${d.ms}ms</span></div>`;
+  $('#drawer').classList.add('on');
+}
+async function openTopic(id) {
+  const d = await (await fetch(`/api/topic?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  focusSet = new Set([...(focusSet || []), ...d.entities.map(x => x.id)]); render();
+  const groups = {sponsor: 'booths', talk: 'talks', speaker: 'featured speakers', person: 'people'};
+  $('#dbox').innerHTML = `<h3>${esc(d.name)}</h3><div class="sub">topic · ${d.entities.length} connected in the graph · click any to drill in</div>` +
+    Object.entries(groups).map(([k, label]) => { const xs = d.entities.filter(x => x.kind === k); return xs.length ? `<div class="dsec">${label}</div>` +
+      xs.map(x => `<div class="dl link" data-open="${esc(x.id)}">${esc(x.name)} <span class="dim">${x.score > 0 ? 'score ' + (x.score * 100).toFixed(0) + ' · ' : ''}covers ${x.p.toFixed(2)}</span></div>`).join('') : ''; }).join('') +
+    `<div class="dsec">FalkorDB query</div><div class="dl"><code style="font:11px var(--mono);color:#9fb0c8">${esc(d.cypher)}</code> <span class="dim">${d.ms}ms</span></div>`;
+  $('#drawer').classList.add('on');
+}
 let pathIds = new Set();
 function highlightPath(item) {
   if (!item) return;
@@ -395,7 +434,13 @@ async function loadGraph() {
   const N = gn.selectAll('g').data(gnodes, d => d.id);
   N.exit().remove();
   const ne = N.enter().append('g').style('cursor', d => ['sponsor', 'speaker', 'talk'].includes(d.kind) || d.kind === 'evidence' ? 'pointer' : 'default')
-    .on('click', (_, d) => { if (['sponsor', 'speaker', 'talk'].includes(d.kind)) openEntity(d.id); else if (d.kind === 'evidence' && d.url) window.open(d.url, '_blank'); })
+    .on('click', (ev, d) => {
+      ev.stopPropagation();
+      if (['sponsor', 'speaker', 'talk', 'person'].includes(d.kind)) openEntity(d.id);
+      else if (d.kind === 'evidence' && d.url) window.open(d.url, '_blank');
+      else if (d.kind === 'criterion') { focusNode(d.id); openCriterion(d.id); }
+      else if (d.kind === 'topic') { focusNode(d.id); openTopic(d.id.slice(2)); }
+    })
     .call(d3.drag().on('start', (e, d) => { if (!e.active) sim.alphaTarget(.3).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; }).on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
   ne.append('title').text(d => d.label);
@@ -602,6 +647,28 @@ document.addEventListener('click', e => {
   if (e.target.classList.contains('starter') || e.target.classList.contains('next')) send(e.target.textContent);
 });
 $('#calbtn').addEventListener('click', () => send('Put my plan in my calendar.'));
+$('#histbtn').addEventListener('click', async () => {
+  const d = await (await fetch('/api/sessions')).json();
+  const ago = ms => { const m = Math.round((Date.now() - ms) / 60000); return m < 60 ? m + 'm ago' : Math.round(m / 60) + 'h ago'; };
+  $('#dbox').innerHTML = `<h3>Previous sessions</h3><div class="sub">stored in FalkorDB · reopening one rebuilds it from the graph, no model calls</div>` +
+    (d.sessions.map(x => `<div class="dl link" data-session="${esc(x.id)}">${esc(x.title)} <span class="dim">· ${x.turns} turns · ${x.criteria} criteria · ${ago(x.updated)}</span></div>`).join('') || '<div class="dl dim">none yet</div>') +
+    `<div class="dsec">FalkorDB query</div><div class="dl"><code style="font:11px var(--mono);color:#9fb0c8">${esc(d.cypher)}</code> <span class="dim">${d.ms}ms</span></div>`;
+  $('#drawer').classList.add('on');
+});
+async function loadSession(id) {
+  const t = Date.now();
+  const d = await (await fetch(`/api/session/load?sid=${encodeURIComponent(id)}`)).json();
+  sid = d.sid; crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
+  Object.keys(why).forEach(k => delete why[k]);
+  d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, state: 'done'}));
+  $('#log').innerHTML = ''; Object.values(rowEls).forEach(el => el.remove()); for (const k in rowEls) delete rowEls[k];
+  d.turns.forEach(x => { chat(esc(x.text), 'u'); if (x.reply) chat(`<span class="model">from graph memory</span><div class="reply">${esc(x.reply)}</div>`, 'a'); });
+  $('#empty').style.display = 'none'; renderHead(); render(); refreshGraph();
+  $('#calbtn').disabled = !rank.some(r => r.score > 0);
+  $('#drawer').classList.remove('on');
+  status(`restored ${d.turns.length} turns, ${crits.length} criteria and ${d.cells.length} scores from the graph in ${Date.now() - t}ms — no model calls`, 0, 'FalkorDB · session restored');
+  d.queries.forEach(q => trace('', 'fk', `restore (${q.ms}ms)<br><code>${esc(q.cypher)}</code>`));
+}
 async function lookupPeople() {
   const people = rank.filter(r => r.score > 0 && ['person', 'speaker'].includes(E[r.id]?.kind) && !(E[r.id].logo || '').includes('licdn')).slice(0, 3);
   for (const r of people) {

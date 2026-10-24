@@ -92,7 +92,9 @@ CALL db.idx.fulltext.queryNodes('Entity', $q) YIELD node, score RETURN node.id, 
 - Talk → presenters → their other talks: `MATCH (p:Person)-[:PRESENTS]->(t:Entity {id:$id}) OPTIONAL MATCH (p)-[:PRESENTS]->(o:Entity) …`
 - Provenance: `MATCH (e:Entity {id:$id})-[:LISTED_ON]->(src:Source) RETURN src.url, src.product`
 
-**Live graph view** (`/api/graph`): you → criteria → topics → recommendations → people → evidence, queried after every write. You can zoom, drag and click it.
+**Live graph view** (`/api/graph`): you → criteria → topics → recommendations → people → evidence, queried after every write. You can zoom, drag and click it. Clicking a topic runs `MATCH (t:Topic {id:$id})-[c:COVERS]->(e:Entity) RETURN … ORDER BY c.p DESC` and lists everything on it. Clicking a criterion shows its `MAPS_TO` topics and its best matches.
+
+**Session history without inference** (`/api/sessions`, `/api/session/load`): each session is a subgraph, `(User)-[:WANTS]->(Criterion)`, `(Turn)-[:IN]->(User)`, plus the shared `SCORED` edges and `Evidence`. Reopening one rebuilds the board, the scores, the evidence and the conversation from those queries in about 300ms, with no agent, decision-model or Bright Data calls.
 
 Every query that runs shows in the trace panel with its latency.
 
@@ -116,6 +118,8 @@ A cell becomes a gap when checking it could change the ranking: a high-weight cr
 | `web_search` | **SERP API**: Google results as JSON (`brd_json=1`, `gl=us`) through Web Unlocker | The answer is probably on third-party pages |
 | `read_site` | **SERP API** to find the official domain if unknown, then **Web Unlocker** to read it as markdown | Vendor capabilities the company states itself |
 | `render_browser` | **Browser API** | Only after `read_site` came back empty or JavaScript-only |
+| person profile | **Web Scraper API: LinkedIn people profiles** (`gd_l1viktl72bvl7bjuj0`): trigger, then progress, then download | Who someone is: company, location, followers, about, photo when public |
+| person photo fallback | **Web Unlocker** on their GitHub profile | LinkedIn hides many photos from logged-out viewers; GitHub avatars are public |
 | `people_search` | **SERP API** with the person's name and the topic | Who a person is: talks, courses, blog posts |
 
 - **Escalation:** if a strategy returns nothing relevant, it's marked as tried, and the router picks again from what's left (search → read site → render).

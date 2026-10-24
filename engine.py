@@ -219,6 +219,7 @@ class Session:
         self.tasks: list[asyncio.Task] = []
         self.calls: dict[str, list] = {}
         self.pins: list[str] = []
+        self.last_reply = ""
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -392,6 +393,7 @@ async def agent_trueforge(session: "Session", text: str):
             ACTIVE = None
     while not session.inbox.empty():
         yield session.inbox.get_nowait()
+    session.last_reply = reply
     yield ev("agent", phase="done", model=config.TRUEFORGE_MODEL, via="TrueForge", status=status,
              ms=int((time.time() - t0) * 1000), ops=session.ops, reply=reply)
 
@@ -802,6 +804,11 @@ async def explain(session: Session, n: int = 3):
 async def turn(session: Session, text: str):
     t0 = time.time()
     yield ev("user", text=text)
+    try:
+        await gq("MERGE (u:User {id:$sid}) ON CREATE SET u.title = $text, u.started = timestamp() "
+                 "SET u.updated = timestamp(), u.pins = $pins", {"sid": session.sid, "text": text[:120], "pins": session.pins})
+    except Exception:
+        pass
     before = set(session.criteria)
     scope_before = session.scope
     if config.TRUEFORGE_URL:
@@ -811,6 +818,7 @@ async def turn(session: Session, text: str):
     else:
         yield ev("agent", phase="start", model=config.LLM_MODEL)
         out, ms = await agent(session, text)
+        session.last_reply = out.get("reply", "")
         yield ev("agent", phase="done", model=config.LLM_MODEL, ms=ms, ops=out.get("ops", []), reply=out.get("reply", ""))
         for e in await apply_ops(session, out.get("ops", [])):
             yield e
@@ -882,6 +890,12 @@ async def turn(session: Session, text: str):
             except asyncio.TimeoutError:
                 pass
         await done
+    try:
+        await gq("MATCH (u:User {id:$sid}) SET u.scope = $scope "
+                 "CREATE (:Turn {text:$text, reply:$reply, at:timestamp()})-[:IN]->(u)",
+                 {"sid": session.sid, "scope": session.scope, "text": text, "reply": session.last_reply})
+    except Exception:
+        pass
     items, cyphers, ms = await explain(session)
     if items:
         yield ev("why", items=items, cypher=cyphers, ms=ms)
