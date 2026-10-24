@@ -414,14 +414,21 @@ function handle(ev) {
       refreshGraph(); break;
     }
     case 'graph_search':
-      status(`walked the graph from your criterion: ${ev.hits} reachable${ev.multihop.length ? ', incl. ' + ev.multihop.slice(0, 2).join(', ') + ' via people' : ''}`, 1, 'FalkorDB shortestPath');
-      trace(s, 'fk', `shortestPath → ${ev.hits} reachable (${ev.ms}ms) · direct: ${esc(ev.direct.slice(0, 5).join(', '))}${ev.multihop.length ? ` · via people: <b>${esc(ev.multihop.join(', '))}</b>` : ''}<br><code>${esc(ev.cypher)}</code>`);
+      {
+        const ct = crits.find(c => c.id === ev.crit)?.text || 'your criterion';
+        status(ev.hits
+          ? `found ${ev.hits} sponsors, talks and people reachable from “${ct}”${ev.multihop.length ? ', including ' + ev.multihop.slice(0, 2).join(', ') + ' through the people who present' : ''}`
+          : `no graph routes from “${ct}” yet, widening the search: full-text next, then one pass over everything`, 1, 'FalkorDB shortestPath');
+      }
+      trace(s, 'fk', `shortestPath → ${ev.hits ? ev.hits + ' reachable' : 'no routes yet, widening'} (${ev.ms}ms) · direct: ${esc(ev.direct.slice(0, 5).join(', '))}${ev.multihop.length ? ` · via people: <b>${esc(ev.multihop.join(', '))}</b>` : ''}<br><code>${esc(ev.cypher)}</code>`);
       break;
     case 'fallback':
       status(`graph had too few routes — one pass over all ${ev.n} with ${ev.model}`, 1, 'Fallback shortlist');
       trace(s, 's1', `graph routes thin → ${esc(ev.model)} choice over ${ev.n} (${ev.ms}ms): ` + ev.top.map(([n, p]) => `${esc(n)} ${p.toFixed(2)}`).join(' · '));
       break;
-    case 'fulltext': trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
+    case 'fulltext': if (!ev.hits.length) status(`no keyword hits either for “${ev.query}”, asking the decision model to scan everything`, 1, 'FalkorDB full-text');
+      else status(`keyword matches: ${ev.hits.join(', ')}`, 1, 'FalkorDB full-text');
+      trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
     case 'why':
       status('tracing your path to each top pick', 1, 'FalkorDB shortestPath');
       ev.items.forEach(it => why[it.id] = it); render();
