@@ -43,15 +43,25 @@ async def add_criterion(text: str, weight: float) -> str:
     return await _apply({"op": "add", "text": text, "weight": weight})
 
 
+def _unknown(ref: str) -> str:
+    s = engine.ACTIVE
+    ids = [{"id": c["id"], "text": c["text"]} for c in s.criteria.values()] if s else []
+    return json.dumps({"error": f"no criterion matches {ref!r}; pass one of these ids", "criteria": ids})
+
+
 @mcp.tool()
 async def remove_criterion(criterion_id: str) -> str:
-    """Remove a criterion by id, when the attendee no longer cares about it."""
+    """Remove a criterion (by id or exact text) ONLY when the attendee says it was a mistake or drops it."""
+    if not engine.ACTIVE or not engine.resolve_crit(engine.ACTIVE, criterion_id):
+        return _unknown(criterion_id)
     return await _apply({"op": "remove", "id": criterion_id})
 
 
 @mcp.tool()
 async def reweight(criterion_id: str, weight: float) -> str:
-    """Change how much a criterion matters (-1.0..1.0)."""
+    """Change how much a criterion (by id or exact text) matters (-1.0..1.0)."""
+    if not engine.ACTIVE or not engine.resolve_crit(engine.ACTIVE, criterion_id):
+        return _unknown(criterion_id)
     return await _apply({"op": "reweight", "id": criterion_id, "weight": weight})
 
 

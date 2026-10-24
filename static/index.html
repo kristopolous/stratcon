@@ -453,7 +453,8 @@ function handle(ev) {
     }
     case 'tf_tool_result': {
       const el = document.querySelector(`.tool[data-call="${CSS.escape(ev.id)}"] .ok`);
-      if (el) { el.textContent = '✓ via MCP'; el.style.color = 'var(--yes)'; }
+      const bad = /"error"|Error executing tool|validation error/i.test(ev.content || '');
+      if (el) { el.textContent = bad ? '✗ ' + (ev.content.match(/no criterion matches[^"]*/)?.[0] || 'tool error') : '✓ via MCP'; el.style.color = bad ? '#e5636b' : 'var(--yes)'; }
       trace(s, 'ag', `tool.response ${esc(ev.content.slice(0, 120))}`);
       break;
     }

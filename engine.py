@@ -256,8 +256,7 @@ ops are any of:
   {"op":"clock","value":"2026-10-28T14:00"}   (when the attendee says what day/time it is at the conference; \
 the conference runs Oct 28-29, 2026)
   {"op":"calendar"}   (when the attendee asks to export, save or add their plan to a calendar)
-Rules: at most 5 criteria in total. If the attendee corrects or clarifies ("no, I mean...", "not that, ..."), \
-remove the criterion being corrected and add the clarified one; never keep both. "Which talks/sessions" means scope talks; "which booths/sponsors" means \
+Rules: at most 5 criteria in total. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). "Which talks/sessions" means scope talks; "which booths/sponsors" means \
 scope sponsors; "which speakers" / "who should I meet" / "people" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
 piling on: "matters less" / "more important" means reweight; "forget" / "drop" / "no longer" means remove. \
 If they bring back something from earlier in the conversation, add it back with the same wording as before. Phrase each criterion concretely in 8 words or fewer so it can be checked against a company description."""
@@ -287,8 +286,7 @@ TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """Edit the rubr
 add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
 conference, Oct 28-29 2026), export_calendar (when they want their plan in a calendar); call get_rubric if you \
 need criterion ids. Make every edit \
-the attendee's message implies, then reply with one short sentence. If the attendee corrects or clarifies \
-("no, I mean..."), remove_criterion the one being corrected and add the clarified one. Rules: at most 5 criteria. "matters less" / \
+the attendee's message implies, then reply with one short sentence. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). Rules: at most 5 criteria. "matters less" / \
 "more important" means reweight; "forget" / "drop" / "no longer" means remove. If they bring back something from \
 earlier, add it back with the same wording as before. Phrase each criterion in 8 words or fewer."""
 
@@ -384,6 +382,19 @@ async def agent_trueforge(session: "Session", text: str):
              ms=int((time.time() - t0) * 1000), ops=session.ops, reply=reply)
 
 
+def resolve_crit(session: "Session", ref) -> str | None:
+    """Accept a criterion id or its text; None if it doesn't name a current criterion."""
+    if not ref or not isinstance(ref, str):
+        return None
+    if ref in session.criteria:
+        return ref
+    want = ref.strip().lower()
+    for cid, c in session.criteria.items():
+        if c["text"].strip().lower() == want or slug(ref) == cid:
+            return cid
+    return None
+
+
 async def gw(events: list, op: str, cy: str, params: dict, **kw):
     try:
         _, ms = await gq(cy, params)
@@ -403,13 +414,13 @@ async def apply_ops(session: Session, ops: list[dict]):
             cy = ("MERGE (u:User {id:$sid}) MERGE (c:Criterion {id:$cid}) ON CREATE SET c.text=$text "
                   "MERGE (u)-[r:WANTS]->(c) SET r.weight=$w")
             await gw(events, "add", cy, {"sid": session.sid, "cid": cid, "text": op["text"], "w": w}, crit=cid)
-        elif kind == "remove" and op.get("id") in session.criteria:
-            cid = op["id"]
+        elif kind == "remove" and resolve_crit(session, op.get("id")):
+            cid = resolve_crit(session, op.get("id"))
             session.criteria.pop(cid)
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) DELETE r"
             await gw(events, "remove", cy, {"sid": session.sid, "cid": cid}, crit=cid)
-        elif kind == "reweight" and op.get("id") in session.criteria:
-            cid = op["id"]
+        elif kind == "reweight" and resolve_crit(session, op.get("id")):
+            cid = resolve_crit(session, op.get("id"))
             w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
             events.append(ev("reweight", crit=cid, before=session.criteria[cid]["weight"], after=w))
             session.criteria[cid]["weight"] = w
