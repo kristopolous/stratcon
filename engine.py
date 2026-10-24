@@ -9,6 +9,7 @@ import httpx
 from falkordb import FalkorDB
 
 import brightdata
+import cache
 import config
 
 graph = None
@@ -166,6 +167,9 @@ async def _post(model: str, state: str, questions: dict) -> dict:
 
 async def systemone(model: str, state: str, questions: dict, _depth: int = 0) -> tuple[dict, int]:
     t = time.time()
+    ck = cache.key(model, state, questions)
+    if (hit := cache.get("systemone", ck)) is not None:
+        return hit, 0
     try:
         if not payload_fits(model, state, questions):
             raise OverflowError("over budget before sending")
@@ -183,6 +187,8 @@ async def systemone(model: str, state: str, questions: dict, _depth: int = 0) ->
             answers, _ = await systemone(model, state[:len(state) // 2] + "\n[... truncated ...]", questions, _depth + 1)
         else:
             raise
+    if _depth == 0:
+        cache.put("systemone", ck, answers)
     return answers, int((time.time() - t) * 1000)
 
 
@@ -274,7 +280,7 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {}
     async with httpx.AsyncClient(timeout=120) as c:
         r = await c.post(f"{config.LLM_BASE_URL}/chat/completions", headers=headers,
-                         json={"model": config.LLM_MODEL, "messages": msgs, "stream": False})
+                         json={"model": config.LLM_MODEL, "messages": msgs, "stream": False, "temperature": 0})
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
     m = re.search(r"\{.*\}", content, re.S)
@@ -322,7 +328,8 @@ async def agent_trueforge(session: "Session", text: str):
     c = tf_client()
     t0 = time.time()
     if not session.tf_id:
-        spec = t.AgentSpec(model=t.Model(name=config.TRUEFORGE_MODEL), instructions=TF_PROMPT,
+        spec = t.AgentSpec(model=t.Model(name=config.TRUEFORGE_MODEL, params=t.ModelParams(temperature=0)),
+                           instructions=TF_PROMPT,
                            mcp_servers=[t.McpServer(name=config.MCP_NAME, enable_tools=["@all"])])
         r = await c.sessions.create(agent=t.SessionAgentSpecBody(spec=spec), metadata={"stratcon_sid": session.sid})
         session.tf_id = getattr(getattr(r, "data", r), "id")
@@ -694,9 +701,11 @@ async def execute(session: Session, g: dict, out: asyncio.Queue):
     session.tried.setdefault((g["e"], g["c"]), []).append({"strategy": s, "outcome": outcome})
     await out.put(ev("evidence", e=e["id"], c=g["c"], strategy=s, product=last["product"], url=url,
                      ms=sum(h["ms"] for h in hits), bytes=last["bytes"], snippet=snippet, ok=ok,
-                     calls=[{"product": h["product"], "target": h["target"], "ms": h["ms"], "bytes": h["bytes"]}
-                            for h in hits]))
-    calls = [{"product": h["product"], "strategy": s, "target": h["target"], "ms": h["ms"], "bytes": h["bytes"]} for h in hits]
+                     cached=all(h.get("cached") for h in hits) if hits else False,
+                     calls=[{"product": h["product"], "target": h["target"], "ms": h["ms"], "bytes": h["bytes"],
+                             "cached": bool(h.get("cached"))} for h in hits]))
+    calls = [{"product": h["product"], "strategy": s, "target": h["target"], "ms": h["ms"], "bytes": h["bytes"],
+              "cached": bool(h.get("cached"))} for h in hits]
     session.calls.setdefault(e["id"], []).extend([{**c, "ok": ok, "criterion": crit} for c in calls])
     return ok, snippet, url, last["product"], calls
 

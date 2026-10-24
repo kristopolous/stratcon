@@ -552,7 +552,7 @@ function handle(ev) {
       break;
     }
     case 'evidence':
-      if (ev.ok) { setCell(ev.e, ev.c, {calls: ev.calls}); trace(s, 'bd', `${esc(ev.product)} ✓ ${(ev.ms / 1000).toFixed(1)}s · ${(ev.bytes / 1024).toFixed(0)} KB · "${esc((ev.snippet || '').slice(0, 90))}…"`); }
+      if (ev.ok) { setCell(ev.e, ev.c, {calls: ev.calls}); trace(s, 'bd', `${esc(ev.product)} ✓ ${ev.cached ? 'cached (fetched earlier in ' + (ev.ms / 1000).toFixed(1) + 's)' : (ev.ms / 1000).toFixed(1) + 's'} · ${(ev.bytes / 1024).toFixed(0)} KB · "${esc((ev.snippet || '').slice(0, 90))}…"`); }
       else { setCell(ev.e, ev.c, {state: 'gap'}); render(); trace(s, 'bd', `${esc(ev.product || ev.strategy)} ✗ ${ev.error ? esc(ev.error) : 'nothing relevant'} — escalating`); }
       break;
     case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
