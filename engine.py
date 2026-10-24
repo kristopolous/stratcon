@@ -381,7 +381,8 @@ async def agent_trueforge(session: "Session", text: str):
             while not session.inbox.empty():
                 yield session.inbox.get_nowait()
     finally:
-        ACTIVE = None
+        if ACTIVE is session:
+            ACTIVE = None
     while not session.inbox.empty():
         yield session.inbox.get_nowait()
     yield ev("agent", phase="done", model=config.TRUEFORGE_MODEL, via="TrueForge", status=status,
