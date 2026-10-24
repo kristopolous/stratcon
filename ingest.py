@@ -154,6 +154,138 @@ async def main():
         print("  e.g.", s["day"], s["time"], "|", s["title"], "|", s["room"], "|", [p["name"] for p in s["speakers"]][:3])
 
 
+TOPICS = {
+    "ci-cd": "CI/CD pipelines, builds and deployment",
+    "testing": "Software testing, QA and test automation",
+    "security": "Application security and vulnerability scanning",
+    "supply-chain": "Software supply chain, dependencies, SBOMs and artifacts",
+    "secrets-identity": "Secrets, identity and access management",
+    "observability": "Observability, monitoring, logging and incident response",
+    "debugging": "Debugging, error tracking and code comprehension",
+    "code-review": "Code review, code quality and static analysis",
+    "agents": "AI coding agents and agentic workflows",
+    "copilot": "GitHub Copilot features and usage",
+    "sandbox": "Sandboxes, isolation and safe execution environments",
+    "platform": "Platform engineering, developer portals and internal tooling",
+    "ai-infra": "AI models, inference and ML infrastructure",
+    "data": "Data platforms, analytics and databases",
+    "docs": "Documentation and knowledge management",
+    "modernization": "Legacy modernization, migration and consulting services",
+    "productivity": "Developer productivity, metrics and engineering management",
+    "open-source": "Open source community and maintainers",
+    "hardware": "Hardware, devices and IoT",
+    "community": "Social events, networking and community",
+}
+
+
+ROLES = {
+    "role-academic": "Academics, professors and researchers",
+    "role-author": "Authors, educators, teachers and content creators",
+    "role-advocate": "Developer advocates and community builders",
+    "role-leader": "Engineering leaders and executives (CTO, VP, director)",
+    "role-founder": "Founders and startup builders",
+    "role-recruiter": "Recruiters, hiring managers and people who hire",
+    "role-engineer": "Hands-on software engineers and architects",
+    "role-product": "Product managers and designers",
+}
+TOPICS_ALL = None
+
+
+async def build_roles():
+    """Classify every person by role into Topic nodes, so people-shaped criteria have a graph route."""
+    import engine
+    g = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+    for tid, label in ROLES.items():
+        g.query("MERGE (t:Topic {id:$id}) SET t.name = $name, t.role = true", {"id": tid, "name": label})
+    g.query("MATCH (:Entity)-[a:ABOUT]->(t:Topic) WHERE t.role = true DELETE a")
+    people = g.query("""MATCH (p:Entity) WHERE p.kind IN ['person', 'speaker']
+                        RETURN p.id, p.name, coalesce(p.title, p.tier, ''), coalesce(p.org, ''), p.description""").result_set
+    t0, edges = time.time(), 0
+    for start in range(0, len(people), 6):
+        chunk = people[start:start + 6]
+        qs = {str(i): {"type": "choice", "instructions": f"Which role best describes [{i}] {n}?", "criteria": ROLES}
+              for i, (_, n, _, _, _) in enumerate(chunk)}
+        state = "\n".join(f"[{i}] {n}, {ti} at {o}. {(d or '')[:200]}" for i, (_, n, ti, o, d) in enumerate(chunk))
+        answers, _ = await engine.systemone(config.SCORE_MODEL, state, qs)
+        rows = []
+        for i, (pid, *_rest) in enumerate(chunk):
+            probs = sorted(answers[str(i)]["probabilities"].items(), key=lambda x: -x[1])
+            rows += [{"e": pid, "t": t, "p": round(p, 3)} for t, p in probs[:2] if p >= 0.2 or t == probs[0][0]]
+        g.query("UNWIND $rows AS r MATCH (e:Entity {id:r.e}), (t:Topic {id:r.t}) CREATE (e)-[:ABOUT {p:r.p}]->(t)", {"rows": rows})
+        edges += len(rows)
+        print(f"  roles {start + len(chunk)}/{len(people)} ({time.time() - t0:.0f}s)", flush=True)
+    print(f"role edges: {edges}")
+    for row in g.query("MATCH (t:Topic {role:true})<-[:ABOUT]-(e) RETURN t.id, count(e) ORDER BY count(e) DESC").result_set:
+        print("  ", row)
+    link_routes()
+
+
+async def build_topics():
+    """Classify every entity into topics (System One choice), then link people to the sponsors they work for."""
+    import engine
+    g = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+    g.query("MATCH (t:Topic) DETACH DELETE t")
+    for tid, label in TOPICS.items():
+        g.query("CREATE (:Topic {id:$id, name:$name})", {"id": tid, "name": label})
+    try:
+        g.query("CALL db.idx.fulltext.createNodeIndex('Topic', 'name')")
+    except Exception:
+        pass
+    ents = [r for r in g.query("MATCH (e:Entity) RETURN e.id, e.name, e.description").result_set]
+    t0, edges = time.time(), 0
+    for start in range(0, len(ents), 6):
+        chunk = ents[start:start + 6]
+        qs = {str(i): {"type": "choice", "instructions": f"Which topic best describes [{i}] {n}?", "criteria": TOPICS}
+              for i, (_, n, _) in enumerate(chunk)}
+        state = "GitHub Universe 2026:\n" + "\n".join(f"[{i}] {n}: {(d or '')[:300]}" for i, (_, n, d) in enumerate(chunk))
+        answers, _ = await engine.systemone(config.ROUTER_MODEL, state, qs)
+        rows = []
+        for i, (eid, _, _) in enumerate(chunk):
+            probs = sorted(answers[str(i)]["probabilities"].items(), key=lambda x: -x[1])
+            rows += [{"e": eid, "t": t, "p": round(p, 3)} for t, p in probs[:3] if p >= 0.12 or t == probs[0][0]]
+        g.query("UNWIND $rows AS r MATCH (e:Entity {id:r.e}), (t:Topic {id:r.t}) CREATE (e)-[:ABOUT {p:r.p}]->(t)",
+                {"rows": rows})
+        edges += len(rows)
+        print(f"  topics {start + len(chunk)}/{len(ents)} ({time.time() - t0:.0f}s)", flush=True)
+    g.query("MATCH (:Person)-[w:WORKS_AT]->() DELETE w")
+    n = g.query("""MATCH (p:Person), (s:Entity {kind:'sponsor'})
+                   WHERE toLower(p.org) CONTAINS toLower(split(s.name, ',')[0])
+                   CREATE (p)-[:WORKS_AT]->(s) RETURN count(*)""").result_set[0][0]
+    print(f"ABOUT edges: {edges}; WORKS_AT edges: {n}; {time.time() - t0:.0f}s")
+    for row in g.query("MATCH (t:Topic)<-[a:ABOUT]-(e) RETURN t.id, count(e) ORDER BY count(e) DESC").result_set:
+        print("  ", row)
+    link_routes()
+
+
+def link_routes():
+    """Directed edges from the attendee outward, so shortestPath can walk You -> ... -> recommendation."""
+    g = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+    for rel in ("COVERS", "PRESENTED_BY", "EMPLOYS"):
+        g.query(f"MATCH ()-[r:{rel}]->() DELETE r")
+    out = {}
+    out["COVERS"] = g.query("MATCH (e:Entity)-[a:ABOUT]->(t:Topic) CREATE (t)-[:COVERS {p:a.p}]->(e) RETURN count(*)").result_set[0][0]
+    out["PRESENTED_BY"] = g.query("MATCH (p:Person)-[:PRESENTS]->(t:Entity) CREATE (t)-[:PRESENTED_BY]->(p) RETURN count(*)").result_set[0][0]
+    out["EMPLOYS"] = g.query("MATCH (p:Person)-[:WORKS_AT]->(s:Entity) CREATE (s)-[:EMPLOYS]->(p) RETURN count(*)").result_set[0][0]
+    print("route edges:", out)
+
+
+def promote_people():
+    """Make every presenter a recommendable person: they inherit topics from the talks they present."""
+    g = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
+    n = g.query("""MATCH (p:Person)-[:PRESENTS]->(t:Entity {kind:'talk'})
+                   OPTIONAL MATCH (s:Entity {kind:'speaker'}) WHERE s.id = p.id
+                   WITH p, s, collect(t.name)[0..2] AS talks WHERE s IS NULL
+                   SET p:Entity, p.kind = 'person', p.tier = coalesce(p.title, ''), p.url = '', p.logo = '',
+                       p.description = coalesce(p.title, '') + ' at ' + coalesce(p.org, '') +
+                                       '. Presenting at GitHub Universe 2026: ' + reduce(acc = '', x IN talks | acc + x + '; ')
+                   RETURN count(p)""").result_set[0][0]
+    g.query("MATCH (p:Entity {kind:'person'})-[a:ABOUT]->() DELETE a")
+    e = g.query("""MATCH (p:Entity {kind:'person'})-[:PRESENTS]->(:Entity {kind:'talk'})-[a:ABOUT]->(t:Topic)
+                   WITH p, t, max(a.p) AS w
+                   CREATE (p)-[:ABOUT {p: w * 0.8}]->(t) RETURN count(*)""").result_set[0][0]
+    print(f"promoted {n} presenters to recommendable people; {e} inherited topic edges")
+
+
 def reset_memory():
     g = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
     for label in ("User", "Criterion", "Evidence"):
@@ -166,5 +298,14 @@ def reset_memory():
 if __name__ == "__main__":
     if "--reset-memory" in sys.argv:
         reset_memory()
+    elif "--topics" in sys.argv:
+        asyncio.run(build_topics())
+    elif "--links" in sys.argv:
+        link_routes()
+    elif "--roles" in sys.argv:
+        asyncio.run(build_roles())
+    elif "--people" in sys.argv:
+        promote_people()
+        link_routes()
     else:
         asyncio.run(main())
