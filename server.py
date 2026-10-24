@@ -81,6 +81,48 @@ async def graph(sid: str):
     return JSONResponse({"nodes": list(nodes.values()), "links": list(uniq.values()), "cypher": cy, "ms": ms})
 
 
+@app.get("/api/entity")
+async def entity(sid: str, id: str):
+    s = session(sid)
+    e = engine.ENTITIES.get(id)
+    if not e:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    queries = []
+    cy = "MATCH (e:Entity {id:$id})-[:LISTED_ON]->(src:Source) RETURN src.url, src.product"
+    rows, ms = await engine.gq(cy, {"id": id})
+    sources = [{"url": u, "product": p} for u, p in rows]
+    queries.append({"cypher": cy, "ms": ms})
+    cy = ("MATCH (e:Entity {id:$id}) OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) OPTIONAL MATCH (x)-[:INFORMS]->(c:Criterion) "
+          "RETURN x.url, x.product, x.snippet, c.text")
+    rows, ms = await engine.gq(cy, {"id": id})
+    evidence = [{"url": u, "product": p, "snippet": sn, "criterion": ct} for u, p, sn, ct in rows if u]
+    queries.append({"cypher": cy, "ms": ms})
+    related = []
+    if e["kind"] == "sponsor":
+        cy = ("MATCH (p:Person)-[:PRESENTS]->(t:Entity {kind:'talk'}) WHERE toLower(p.org) CONTAINS toLower($org) "
+              "RETURN p.name, p.title, t.id, t.name, t.when, t.room LIMIT 12")
+        rows, ms = await engine.gq(cy, {"org": e["name"].split(",")[0]})
+        related = [{"label": f"{pn} ({pt}) presents", "id": ti, "name": tn, "when": tw, "room": tr} for pn, pt, ti, tn, tw, tr in rows]
+        queries.append({"cypher": cy, "ms": ms})
+    elif e["kind"] == "speaker":
+        cy = "MATCH (e:Entity {id:$id})-[:PRESENTS]->(t:Entity) RETURN t.id, t.name, t.when, t.room"
+        rows, ms = await engine.gq(cy, {"id": id})
+        related = [{"label": "presents", "id": ti, "name": tn, "when": tw, "room": tr} for ti, tn, tw, tr in rows]
+        queries.append({"cypher": cy, "ms": ms})
+    elif e["kind"] == "talk":
+        cy = ("MATCH (p:Person)-[:PRESENTS]->(t:Entity {id:$id}) OPTIONAL MATCH (p)-[:PRESENTS]->(o:Entity) WHERE o.id <> $id "
+              "RETURN p.name, p.title, p.org, collect(DISTINCT o.name)[0..3]")
+        rows, ms = await engine.gq(cy, {"id": id})
+        related = [{"label": f"{pn}, {pt} · {po}", "also": also} for pn, pt, po, also in rows]
+        queries.append({"cypher": cy, "ms": ms})
+    scores = [{"criterion": c["text"], "weight": c["weight"], **({"p": s.cells[(id, cid)]["p"],
+               "evidence": s.cells[(id, cid)].get("evidence")} if (id, cid) in s.cells else {})}
+              for cid, c in s.criteria.items()]
+    score = next((r["score"] for r in s.ranking(everything=True) if r["id"] == id), None)
+    return JSONResponse({"entity": e, "score": score, "scores": scores, "evidence": evidence, "related": related,
+                         "sources": sources, "queries": queries})
+
+
 @app.get("/api/calendar.ics")
 async def calendar(sid: str):
     from fastapi.responses import Response

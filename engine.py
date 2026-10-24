@@ -250,6 +250,9 @@ async def agent_trueforge(session: "Session", text: str):
     ACTIVE = session
     rubric = [{"id": k["id"], "text": k["text"], "weight": k["weight"]} for k in session.criteria.values()]
     reply, status = "", ""
+    calls: dict[tuple, dict] = {}
+    by_id: dict[str, dict] = {}
+    text_parts: dict[str, str] = {}
     try:
         res = c.sessions.create_turn_stream(
             session_id=session.tf_id,
@@ -261,13 +264,34 @@ async def agent_trueforge(session: "Session", text: str):
             kind = getattr(e, "type", "")
             if kind == "mcp.initialize":
                 yield ev("tf_mcp", servers=[getattr(m, "name", "") for m in (e.mcp_servers or [])])
+            elif kind == "model.message.delta":
+                if e.content:
+                    text_parts[e.id] = text_parts.get(e.id, "") + e.content
+                    reply = text_parts[e.id].strip()
+                for tc in e.tool_calls or []:
+                    c = calls.setdefault((e.id, tc.index), {"id": None, "name": "", "args": "", "server": ""})
+                    if tc.id:
+                        c["id"] = tc.id
+                        by_id[tc.id] = c
+                    if tc.function and tc.function.name:
+                        c["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        c["args"] += tc.function.arguments
+                    info = getattr(tc, "tool_info", None)
+                    if info is not None and getattr(info, "name", None):
+                        c["tool"] = getattr(info, "name", "")
+                        c["server"] = getattr(info, "server_name", None) or getattr(info, "type", "")
             elif kind == "model.message":
                 if _text(e.content).strip():
                     reply = _text(e.content).strip()
                 for tc in e.tool_calls or []:
-                    yield ev("tf_tool_call", id=tc.id, name=tc.function.name, args=tc.function.arguments,
-                             model=getattr(e, "model", None))
+                    by_id.setdefault(tc.id, {"id": tc.id, "name": tc.function.name, "args": tc.function.arguments or ""})
             elif kind == "tool.response":
+                c = by_id.get(e.tool_call_id)
+                if c and not c.get("shown"):
+                    c["shown"] = True
+                    yield ev("tf_tool_call", id=e.tool_call_id, name=c.get("tool") or c["name"], harness_tool=c["name"],
+                             args=c["args"], server=c.get("server", ""))
                 yield ev("tf_tool_result", id=e.tool_call_id, content=_text(e.content)[:300])
             elif kind == "turn.done":
                 status = getattr(e.state, "status", "")
