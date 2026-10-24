@@ -1,0 +1,146 @@
+# Booth & speaker recommender — Patch the Conference hackathon
+
+Event: https://luma.com/ptc — Bright Data, 625 2nd St SF, 9am–7pm, demo on stage 5:30.
+Tracks: FalkorDB (iPhone Duos) · Bright Data ($1.5k) · TrueForge/TrueFoundry + OpenAI ($1k) · Qodo ($500)
+
+## Original sketch
+truefoundary with jev style queries. The user discusses what they care about;
+this leads to a classifier with truefoundry, and brightdata agents go out until
+the confidence score is hit. Goal: know who, the priority, and what to talk
+about — not just a list of the who.
+
+## One sentence
+"Tell it what you're here for. It tells you which booths to visit and which
+speakers to meet, in order, and exactly why. When it's not sure, it figures
+out how to find out."
+
+Pitch: recommender systems have never told you why. This one does, cites its
+sources, and goes and checks when it isn't confident.
+
+## What the user sees
+  Me: I'm building a RAG app, our scraping keeps breaking, and I want to cut LLM costs.
+
+  1. Bright Data — booth 4
+     Because: your scraping keeps breaking → Web Unlocker handles blocked sites  [source]
+     Ask them: "Does the MCP server work with my agent framework?"
+
+  2. Talk to <speaker> — 2:30 talk, also at FalkorDB booth
+     Because: you're building RAG → they built FalkorDB's GraphRAG SDK  [source: GitHub]
+     Ask them: "How does GraphRAG compare on cost vs vector RAG?"
+
+  3. FalkorDB — booth 2
+     Because: RAG → GraphRAG is their headline use case  [source: docs]
+     ⚠️ not sure they help with cost → reading their pricing page… ✅ 0.91
+
+  Skip: Qodo — code review isn't on your list.
+
+Then: "actually cost matters most" → list reorders, reasons change, new gap → new fetch.
+
+## Entities
+- Sponsors / exhibitors: company, products, claims, pricing, booth.
+- Speakers, two layers:
+  - Trivial: what they're talking about — title, time, abstract from the agenda.
+  - Interesting: WHO they are — role, company, what they've built (GitHub repos,
+    papers, products), past talks, what they post about, whether they're at a booth.
+    That's how we get "talk to X because they built Y, ask them Z".
+  - Public professional info only (speakers/sponsor reps are public in this context).
+    No personal/contact scraping.
+
+## Three decisions, one fast model (System One: clef / nimble on Ollama)
+The LLM writes the rules and the sentences; the decision model applies them, many times, quickly.
+
+1. SCORE — does this booth/speaker match a criterion?  (Noul / Score per criterion)
+2. GAP   — am I sure enough?  (calibrated probability vs threshold)
+3. STRATEGY — what's the cheapest way to find out?  (Choice over Bright Data strategies)
+
+Loop: score → unsure? → pick strategy → fetch → write evidence → rescore → escalate if still unsure.
+All three are the same `decide(context, question, options)` call. Strategies already
+tried drop out of the options, so escalation comes for free. Log every decision + probability
+→ visible trace ("picked Unlocker 0.81 over SERP 0.12").
+
+Model choice: clef (best calibrated, ECE 0.040) for gap/confidence; Nimble v4 Max (66.6 index)
+where accuracy matters more. Avoid Nimble 9B v3 for confidence (ECE 0.12).
+
+## Criteria document (written live by the TrueForge agent as the user talks)
+  {
+    "criteria": [
+      {"id":"scraping","type":"noul","q":"Helps with scraping that breaks/gets blocked","weight":0.4},
+      {"id":"rag","type":"noul","q":"Relevant to building a RAG app","weight":0.3},
+      {"id":"cost","type":"score","q":"Helps reduce LLM cost","scale":5,"weight":0.3},
+      {"id":"recruiter","type":"noul","q":"Is purely a recruiting booth","veto":true}
+    ],
+    "threshold": 0.8
+  }
+User edits by talking → agent rewrites doc → everything rescores (cheap, fast).
+
+## Bright Data strategy menu (the options for decision #3)
+| Gap example                                   | Strategy                                   | Cost  |
+|-----------------------------------------------|--------------------------------------------|-------|
+| "does X help with cost?" (no URL yet)         | SERP API (search_engine / batch)           | cheap |
+| "free tier?" (know the page)                  | Web Unlocker (scrape_as_markdown /pricing) | cheap |
+| structured facts from a page                  | extract                                    | med   |
+| company size / stage                          | Business Search — Ludicrous                | cheap |
+| who is this speaker / who works at the booth  | Business Search People / LinkedIn scraper  | med   |
+| what has this speaker built                   | GitHub scraper / SERP → Unlocker           | med   |
+| do real users like it                         | Web Scraper API (G2, Reddit)               | med   |
+| where's the booth / interactive agenda        | Browser API                                | slow  |
+| hard entity match, needs ranking              | Business Search — Smart                    | $$    |
+Escalation ladder: SERP → Unlocker → extract/Scraper → Smart Business Search → Browser.
+Pitch to Bright Data: agents shouldn't have to know your catalog; a decision model routes to
+the right product and only escalates when the cheap one wasn't enough.
+
+## FalkorDB = agent memory; the reason IS a graph path
+  (You)-[CARES_ABOUT]->(flaky scraping)<-[SOLVES]-(Web Unlocker)<-[SELLS]-(Bright Data)-[AT]->(Booth 4)
+                                                       └-[EVIDENCE {p:0.94, src:url}]
+  (You)-[CARES_ABOUT]->(RAG)<-[BUILT]-(Speaker)-[WORKS_AT]->(FalkorDB)-[AT]->(Booth 2)
+                                         └-[GIVES]->(Talk @2:30)
+
+Nodes: User, Criterion, Topic, Sponsor, Product, Speaker, Talk, Project, Booth, Source, GapType, Strategy
+Three kinds of memory:
+- What you care about: Criterion nodes + weights, edited live.
+- What we know: claims/evidence edges with decision-model probability + source. Re-used; no re-scrape.
+- What worked: (GapType)-[TRIED]->(Strategy) {conf_before, conf_after}. Strategy picker learns
+  "pricing questions → Unlocker /pricing works, skip SERP". Agent gets cheaper over the session.
+Recommendation = top-ranked paths; sentence = path read out loud. ~4 hops = their benchmark case.
+Stretch: cross-attendee memory ("12 people who cared about cost went to FalkorDB first").
+
+## Stack
+- TrueForge (TrueFoundry) + OpenAI: conversation → criteria doc; paths → sentences; agent runtime.
+  Pitch: "decision node" as a drop-in TrueForge skill (verify they don't already have one).
+- clef / nimble via Ollama (Pydantic AI `system-one` models): score, gap, strategy.
+- Bright Data (MCP / APIs): evidence gathering.
+- FalkorDB: memory + explainable paths (show highlighted path in FalkorDB browser on stage).
+- Qodo: run our PRs through it.
+- UI: one web page, three panes — chat | live criteria | ranked booths & speakers with reasons + "checking…" trace.
+
+## Demo script (~3 min)
+1. "Here's what I'm here for" → criteria build themselves on screen.
+2. Ranked booths + speakers appear with "Because:" lines and sources; a couple show ⚠️ unsure.
+3. Agents fetch ("reading their pricing page…"); unsure items lock in.
+4. "Actually cost matters most" → reshuffle, new reasons, new gap → new fetch.
+5. 20s for judges: the reason is a FalkorDB path; strategy choice is a decision model; drop-in for TrueForge.
+Run it on THIS event's sponsors and speakers.
+
+## Fallbacks
+- Pre-scrape sponsors + speakers before 5pm; cache evidence in FalkorDB. Live fetch is a bonus.
+- If Ollama is unreachable on venue wifi: local small model or cached decisions replay.
+- Recorded backup video of the full flow.
+
+## Schedule
+09:00–10:00  Setup: repo, keys (OpenAI, Bright Data credits, TrueForge), Ollama reachability,
+             FalkorDB docker. Grab sponsor list + speaker list/agenda.
+10:00–11:00  Workshops (TrueForge + Bright Data especially). Meanwhile: decide() wrapper + tests.
+11:00–12:30  Ingest: sponsors (Unlocker on sites), speakers (agenda = trivial; who-they-are via
+             Business Search/LinkedIn/GitHub). Write graph schema + loaders.
+12:30–14:00  Scoring loop: criteria doc → score → gap → strategy → fetch → rescore.
+14:00–15:30  TrueForge agent: chat → criteria doc edits; path → "Because:" sentences.
+15:30–16:45  UI three panes + trace. Wire it all together.
+16:45–17:15  Pre-warm cache, rehearse, record backup video. PRs through Qodo.
+17:15–17:30  Freeze.
+
+## Open items
+- Ollama URL + model tags (clef, nimble)
+- Bright Data API key / event credits; Business Search beta access
+- TrueForge vs TrueFoundry naming + docs; confirm no existing decision-model integration
+- Speaker list / agenda source for this event (and a backup real-conference expo page)
+- Team size

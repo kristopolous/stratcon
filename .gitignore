@@ -1,0 +1,12 @@
+keys
+*.pyc
+__pycache__/
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+*.log
+.DS_Store
+.falkordb_test
+cache.txt
