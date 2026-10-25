@@ -453,7 +453,7 @@ async def apply_ops(session: Session, ops: list[dict]):
                 pass
         elif kind == "calendar":
             items = plan(session)
-            events.append(ev("calendar", url=f"/api/calendar.ics?sid={session.sid}",
+            events.append(ev("calendar", url=f"api/calendar.ics?sid={session.sid}",
                              items=[{"title": i["title"], "start": i["start"].strftime("%a %-I:%M %p"),
                                      "where": i["where"]} for i in items]))
     return events

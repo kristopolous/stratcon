@@ -224,7 +224,7 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u || ''; } };
 const STRAT = {web_search: 'search', read_site: 'read site', render_browser: 'render', people_search: 'people'};
 
-fetch('/api/entities').then(r => r.json()).then(list => {
+fetch('api/entities').then(r => r.json()).then(list => {
   list.forEach(e => E[e.id] = e);
   const n = k => list.filter(e => e.kind === k).length;
   $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker') + n('person')} people`;
@@ -346,7 +346,7 @@ $('#drawer').addEventListener('click', e => {
   const tp = e.target.closest('[data-topic]'); if (tp) { focusNode('t:' + tp.dataset.topic); openTopic(tp.dataset.topic); }
 });
 async function openEntity(id) {
-  const d = await (await fetch(`/api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  const d = await (await fetch(`api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
   if (d.error) return;
   const e = d.entity, kind = e.kind === 'talk' ? `${e.tier || 'Talk'} · ${e.when}${e.room ? ' · ' + e.room : ''}` : e.kind === 'speaker' ? `Featured speaker · ${e.org}` : e.kind === 'person' ? `${e.tier} · ${e.org} · presenting` : `${e.tier} sponsor`;
   const host2 = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u; } };
@@ -381,11 +381,11 @@ async function openEntity(id) {
         (p.cached ? '' : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s</div>`).join(''));
       if (pr && pr.photo) { E[e.id].logo = pr.photo; render(); }
     };
-    let p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+    let p = await (await fetch(`api/enrich?id=${encodeURIComponent(e.id)}`)).json();
     render1(p);
     while (p.scraper && p.scraper.status === 'running' && $('#drawer').classList.contains('on')) {
       await new Promise(r => setTimeout(r, 5000));
-      p = await (await fetch(`/api/enrich?id=${encodeURIComponent(e.id)}`)).json();
+      p = await (await fetch(`api/enrich?id=${encodeURIComponent(e.id)}`)).json();
       render1(p);
     }
   }
@@ -415,7 +415,7 @@ function clearFocus() {
 }
 svg.on('click', () => clearFocus());
 async function openCriterion(id) {
-  const d = await (await fetch(`/api/criterion?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  const d = await (await fetch(`api/criterion?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
   focusSet = new Set([...(focusSet || []), ...d.best.filter(b => b.p >= .5).map(b => b.id)]); render();
   $('#dbox').innerHTML = `<h3>“${esc(d.text)}”</h3><div class="sub">criterion · weight ${d.weight}</div>
     <div class="dsec">maps to topics (FalkorDB MAPS_TO)</div>${d.topics.map(t => `<div class="dl link" data-topic="${esc(t.id)}">${esc(t.name)} <span class="dim">${t.p.toFixed(2)}</span></div>`).join('') || '<div class="dl dim">none</div>'}
@@ -424,7 +424,7 @@ async function openCriterion(id) {
   $('#drawer').classList.add('on');
 }
 async function openTopic(id) {
-  const d = await (await fetch(`/api/topic?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  const d = await (await fetch(`api/topic?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
   focusSet = new Set([...(focusSet || []), ...d.entities.map(x => x.id)]); render();
   const groups = {sponsor: 'booths', talk: 'talks', speaker: 'featured speakers', person: 'people'};
   $('#dbox').innerHTML = `<h3>${esc(d.name)}</h3><div class="sub">topic · ${d.entities.length} connected in the graph · click any to drill in</div>` +
@@ -442,7 +442,7 @@ function highlightPath(item) {
 }
 function refreshGraph() { clearTimeout(gtimer); gtimer = setTimeout(loadGraph, 500); }
 async function loadGraph() {
-  const g = await (await fetch('/api/graph?sid=' + sid)).json();
+  const g = await (await fetch('api/graph?sid=' + sid)).json();
   const old = Object.fromEntries(gnodes.map(n => [n.id, n]));
   const r = $('#graph').getBoundingClientRect();
   sim.force('center', d3.forceCenter(r.width / 2, r.height / 2));
@@ -645,7 +645,7 @@ async function send(text) {
   chat(esc(text), 'u'); $('#q').value = '';
   const mine = ctrl = new AbortController();
   let res;
-  try { res = await fetch('/api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text, pins: [...pins]}), signal: mine.signal}); }
+  try { res = await fetch('api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text, pins: [...pins]}), signal: mine.signal}); }
   catch { return; }
   const rd = res.body.getReader(), dec = new TextDecoder(); let buf = '';
   for (;;) {
@@ -673,7 +673,7 @@ function closeSide() { $('#side').classList.remove('on'); $('#sidebg').classList
 async function openSide() {
   $('#side').classList.add('on'); $('#sidebg').classList.add('on');
   $('#sesslist').innerHTML = '<div class="sidesub">loading…</div>';
-  const d = await (await fetch('/api/sessions')).json();
+  const d = await (await fetch('api/sessions')).json();
   const ago = ms => { const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? 'just now' : m < 60 ? m + 'm ago' : Math.round(m / 60) + 'h ago'; };
   $('#sesslist').innerHTML = d.sessions.map(x => `<div class="sess ${x.id === sid ? 'cur' : ''}" data-session="${esc(x.id)}">
       <div class="t">${esc(x.title)}</div><div class="m">${x.turns} turns · ${x.criteria} criteria · ${ago(x.updated)}</div></div>`).join('') || '<div class="sidesub">No sessions yet.</div>';
@@ -686,7 +686,7 @@ $('#sesslist').addEventListener('click', e => { const x = e.target.closest('[dat
 $('#newsess').addEventListener('click', () => location.reload());
 async function loadSession(id) {
   const t = Date.now();
-  const d = await (await fetch(`/api/session/load?sid=${encodeURIComponent(id)}`)).json();
+  const d = await (await fetch(`api/session/load?sid=${encodeURIComponent(id)}`)).json();
   sid = d.sid; crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
   Object.keys(why).forEach(k => delete why[k]);
   d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, state: 'done'}));
@@ -702,10 +702,10 @@ async function lookupPeople() {
   const people = rank.filter(r => r.score > 0 && ['person', 'speaker'].includes(E[r.id]?.kind) && !(E[r.id].logo || '').includes('licdn')).slice(0, 3);
   for (const r of people) {
     trace(((Date.now() / 1000) - t0).toFixed(1) + 's', 'bd', `Bright Data LinkedIn people profiles → ${esc(E[r.id].name)}`);
-    let p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
+    let p = await (await fetch(`api/enrich?id=${encodeURIComponent(r.id)}`)).json();
     for (let i = 0; i < 40 && p.scraper && p.scraper.status === 'running'; i++) {
       await new Promise(res => setTimeout(res, 6000));
-      p = await (await fetch(`/api/enrich?id=${encodeURIComponent(r.id)}`)).json();
+      p = await (await fetch(`api/enrich?id=${encodeURIComponent(r.id)}`)).json();
     }
     const pr = p.scraper && p.scraper.profile;
     if (pr && pr.photo) { E[r.id].logo = pr.photo; render(); }
