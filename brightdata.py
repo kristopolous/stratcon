@@ -71,10 +71,18 @@ def _real_link(o: dict) -> str:
     link = o.get("link", "")
     if "google.com/goto" not in link and "google.com/url" not in link:
         return link
+    from urllib.parse import urlparse, parse_qs
+    qs = parse_qs(urlparse(link).query)
+    for k in ("url", "q"):
+        if qs.get(k) and qs[k][0].startswith("http"):
+            return qs[k][0]
     shown = o.get("display_link", "")
     if "…" in shown or "..." in shown:
         shown = shown.split(" › ")[0]
-    return shown.replace(" › ", "/").strip() or link
+    shown = shown.replace(" › ", "/").strip()
+    if not shown or " " in shown:
+        return link
+    return shown if shown.startswith("http") else "https://" + shown
 
 
 async def serp(query: str) -> dict:

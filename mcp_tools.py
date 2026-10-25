@@ -40,8 +40,13 @@ async def get_rubric() -> str:
 
 
 @mcp.tool()
-async def add_criterion(text: str, weight: float) -> str:
+async def add_criterion(text: str | dict, weight: float = 0.6) -> str:
     """Add a yes/no-checkable criterion (8 words or fewer). Weight 0.1..1.0, or negative (-1.0..-0.1) to avoid."""
+    if isinstance(text, dict):  # small models sometimes nest the arguments one level deep
+        weight = text.get("weight", weight)
+        text = str(text.get("text", ""))
+    if not text.strip():
+        return json.dumps({"error": "text is required, e.g. add_criterion(text='Hiring engineers', weight=0.8)"})
     return await _apply({"op": "add", "text": text, "weight": weight})
 
 
@@ -126,13 +131,26 @@ async def graph_query(cypher: str) -> str:
         return json.dumps({"error": "read-only: CREATE/MERGE/SET/DELETE are not allowed"})
     q = cypher if re.search(r"\bLIMIT\b", cypher, re.I) else cypher.rstrip("; ") + " LIMIT 20"
     try:
-        rows, ms = await engine.gq(q, {}, timeout=10)
+        rows, ms = await engine.gq(q, {}, timeout=10, read_only=True)
     except Exception as x:
         return json.dumps({"error": str(x)[:300]})
     s = engine.ACTIVE
     if s is not None:
         await s.inbox.put(engine.ev("graph", op="agent_query", cypher=q, ms=ms, n=len(rows)))
-    return json.dumps({"rows": [[_plain(v) for v in r] for r in rows[:20]], "ms": ms}, default=str)[:6000]
+    out = [[_clip(_plain(v)) for v in r] for r in rows[:20]]
+    while out and len(json.dumps(out, default=str)) > 6000:
+        out.pop()
+    return json.dumps({"rows": out, "ms": ms, "omitted": min(len(rows), 20) - len(out)}, default=str)
+
+
+def _clip(v):
+    if isinstance(v, str):
+        return v[:400]
+    if isinstance(v, list):
+        return [_clip(x) for x in v[:20]]
+    if isinstance(v, dict):
+        return {k: _clip(x) for k, x in list(v.items())[:20]}
+    return v
 
 
 @mcp.tool()
@@ -168,7 +186,51 @@ class TokenGuard(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _unnest(args: dict) -> dict:
+    """Small models sometimes wrap each argument in an object named after it ({"weight": {"weight": 1}})
+    or nest all of them under the first one; flatten both before schema validation."""
+    out = {}
+    for k, v in args.items():
+        if isinstance(v, dict) and k in v:
+            out.update({kk: vv for kk, vv in v.items() if kk not in out})
+            out[k] = v[k]
+        else:
+            out[k] = v
+    return out
+
+
+class Unnest:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST":
+            return await self.app(scope, receive, send)
+        body, more = b"", True
+        while more:
+            m = await receive()
+            body += m.get("body", b"")
+            more = m.get("more_body", False)
+        try:
+            msg = json.loads(body)
+            if isinstance(msg, dict) and msg.get("method") == "tools/call" and isinstance(msg["params"].get("arguments"), dict):
+                msg["params"]["arguments"] = _unnest(msg["params"]["arguments"])
+                body = json.dumps(msg).encode()
+        except (ValueError, KeyError, AttributeError):
+            pass
+        sent = False
+
+        async def replay():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+        await self.app(scope, replay, send)
+
+
 def app():
     a = mcp.streamable_http_app()
+    a.add_middleware(Unnest)
     a.add_middleware(TokenGuard)
     return a

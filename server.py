@@ -54,7 +54,7 @@ async def turn(req: Request):
         s.tasks = []
         if s.tf_id and engine.config.TRUEFORGE_URL:
             try:
-                await engine.tf_client().sessions.cancel(session_id=s.tf_id)
+                await asyncio.wait_for(engine.tf_client().sessions.cancel(session_id=s.tf_id), 3)
             except Exception:
                 pass
         aborted = True
@@ -75,14 +75,21 @@ async def turn(req: Request):
         finally:
             await q.put(None)
 
-    s.current = asyncio.create_task(produce())
+    s.current = mine = asyncio.create_task(produce())
 
     async def stream():
-        while True:
-            e = await q.get()
-            if e is None:
-                break
-            yield f"data: {json.dumps(e)}\n\n"
+        try:
+            while True:
+                e = await q.get()
+                if e is None:
+                    break
+                yield f"data: {json.dumps(e)}\n\n"
+        finally:
+            if s.current is mine and not mine.done():
+                mine.cancel()
+                for t in s.tasks:
+                    t.cancel()
+                s.tasks = []
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

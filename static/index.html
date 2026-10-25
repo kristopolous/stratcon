@@ -558,7 +558,7 @@ function handle(ev) {
       trace(s, 'fk', `full-text "${esc(ev.query)}" (${ev.ms}ms) → ${esc(ev.hits.join(', ') || 'no hits')}`); break;
     case 'why':
       status('tracing your path to each top pick', 1, 'FalkorDB shortestPath');
-      ev.items.forEach(it => why[it.id] = it); render();
+      Object.keys(why).forEach(k => delete why[k]); ev.items.forEach(it => why[it.id] = it); render();
       trace(s, 'fk', `why: shortestPath from you to top ${ev.items.length} (${ev.ms}ms)<br>` + ev.items.map(it => `${esc(E[it.id]?.name)}: ${esc(pathText(it))}`).join('<br>'));
       highlightPath(ev.items[0]); break;
     case 'tf_session': trace(s, 'ag', `TrueForge session ${esc(ev.id)} (${ev.ms}ms)`); break;
@@ -568,6 +568,8 @@ function handle(ev) {
       const label = id => esc(crits.find(c => c.id === id)?.text || id);
       let inner = ev.name, x = a;
       if (ev.name === 'call_tool') { inner = a.tool_name; x = a.input || {}; }
+      // same flattening the MCP server applies: {"weight": {"weight": 1}} or everything nested under the first arg
+      x = Object.entries(x).reduce((o, [k, v]) => v && typeof v === 'object' && k in v ? {...v, ...o, [k]: v[k]} : {...o, [k]: v}, {});
       const body = inner === 'add_criterion' ? `"${esc(x.text)}", ${x.weight}` : inner === 'reweight' ? `"${label(x.criterion_id)}", ${crits.find(c => c.id === x.criterion_id)?.weight ?? '?'} → ${x.weight}` :
         inner === 'remove_criterion' ? `"${label(x.criterion_id)}"` : inner === 'set_scope' ? `"${esc(x.scope)}"` : inner === 'set_clock' ? `"${esc(x.iso_datetime)}"` :
         inner === 'list_tools' ? `"${esc(a.mcp_server)}"` : inner === 'get_tool_info' ? `"${esc(a.mcp_server)}", "${esc(a.tool_name)}"` :
@@ -636,7 +638,7 @@ function handle(ev) {
     case 'fetch': {
       const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `SERP API: ${ev.target}`) :
         ev.product === 'Web Unlocker' ? `reading ${host(ev.target)}` : `rendering ${host(ev.target)} in browser`;
-      if (ev.e && ev.c) setTimeout(() => { setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
+      if (ev.e && ev.c) setTimeout(() => { const c = cells[ev.e + '|' + ev.c]; if (c && !['gap', 'route'].includes(c.state)) return; setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
       trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(doing + ` (for ${E[ev.e]?.name})`, 1, `Bright Data ${ev.product}`);
       break;
     }
@@ -668,17 +670,20 @@ async function send(text) {
   chat(esc(text), 'u'); $('#q').value = '';
   const mine = ctrl = new AbortController();
   let res;
-  try { res = await fetch('api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text, pins: [...pins]}), signal: mine.signal}); }
-  catch { return; }
-  const rd = res.body.getReader(), dec = new TextDecoder(); let buf = '';
-  for (;;) {
-    let r; try { r = await rd.read(); } catch { return; }
-    const {value, done} = r; if (done) break;
-    if (mine !== ctrl) return;
-    buf += dec.decode(value, {stream: true});
-    let i; while ((i = buf.indexOf('\n\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 2); if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6))); }
+  try {
+    res = await fetch('api/turn', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, text, pins: [...pins]}), signal: mine.signal});
+    const rd = res.body.getReader(), dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const {value, done} = await rd.read(); if (done) break;
+      if (mine !== ctrl) return;
+      buf += dec.decode(value, {stream: true});
+      let i; while ((i = buf.indexOf('\n\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 2); if (line.startsWith('data: ')) { try { handle(JSON.parse(line.slice(6))); } catch (x) { console.error(x); } } }
+    }
+  } catch (x) {
+    if (mine === ctrl && x.name !== 'AbortError') status('connection lost — say it again to retry');
+  } finally {
+    if (mine === ctrl) busy = false;
   }
-  busy = false;
 }
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') send(e.target.value); });
 const CLARIFY = {

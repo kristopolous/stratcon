@@ -220,6 +220,19 @@ async def build_roles():
     link_routes()
 
 
+def link_employers(g) -> int:
+    """WORKS_AT by whole-word organisation match, so "Port" doesn't claim people at "Support" or "Passport"."""
+    import re
+    g.query("MATCH (:Person)-[w:WORKS_AT]->() DELETE w")
+    people = g.query("MATCH (p:Person) WHERE p.org IS NOT NULL AND p.org <> '' RETURN p.id, p.org").result_set
+    sponsors = g.query("MATCH (s:Entity {kind:'sponsor'}) RETURN s.id, s.name").result_set
+    pats = [(sid, re.compile(r"(?<![a-z0-9])" + re.escape(name.split(",")[0].strip().lower()) + r"(?![a-z0-9])"))
+            for sid, name in sponsors if name.split(",")[0].strip()]
+    rows = [{"p": pid, "s": sid} for pid, org in people for sid, pat in pats if pat.search(org.lower())]
+    g.query("UNWIND $rows AS r MATCH (p:Person {id:r.p}), (s:Entity {id:r.s}) CREATE (p)-[:WORKS_AT]->(s)", {"rows": rows})
+    return len(rows)
+
+
 async def build_topics():
     """Classify every entity into topics (System One choice), then link people to the sponsors they work for."""
     import engine
@@ -229,6 +242,10 @@ async def build_topics():
         g.query("CREATE (:Topic {id:$id, name:$name})", {"id": tid, "name": label})
     try:
         g.query("CALL db.idx.fulltext.createNodeIndex('Topic', 'name')")
+    except Exception:
+        pass
+    try:
+        g.query("CALL db.idx.fulltext.createNodeIndex('Entity', 'name', 'description')")
     except Exception:
         pass
     ents = [r for r in g.query("MATCH (e:Entity) RETURN e.id, e.name, e.description").result_set]
@@ -247,10 +264,7 @@ async def build_topics():
                 {"rows": rows})
         edges += len(rows)
         print(f"  topics {start + len(chunk)}/{len(ents)} ({time.time() - t0:.0f}s)", flush=True)
-    g.query("MATCH (:Person)-[w:WORKS_AT]->() DELETE w")
-    n = g.query("""MATCH (p:Person), (s:Entity {kind:'sponsor'})
-                   WHERE toLower(p.org) CONTAINS toLower(split(s.name, ',')[0])
-                   CREATE (p)-[:WORKS_AT]->(s) RETURN count(*)""").result_set[0][0]
+    n = link_employers(g)
     print(f"ABOUT edges: {edges}; WORKS_AT edges: {n}; {time.time() - t0:.0f}s")
     for row in g.query("MATCH (t:Topic)<-[a:ABOUT]-(e) RETURN t.id, count(e) ORDER BY count(e) DESC").result_set:
         print("  ", row)
@@ -307,5 +321,13 @@ if __name__ == "__main__":
     elif "--people" in sys.argv:
         promote_people()
         link_routes()
+    elif "--employers" in sys.argv:
+        print("WORKS_AT edges:", link_employers(FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)))
+        link_routes()
     else:
+        # The full pipeline, in dependency order: entities, people, topics, roles, then the route edges search walks.
         asyncio.run(main())
+        promote_people()
+        asyncio.run(build_topics())
+        asyncio.run(build_roles())
+        link_routes()
