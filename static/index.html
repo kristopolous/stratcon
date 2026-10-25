@@ -341,7 +341,7 @@ $('#rows').addEventListener('click', ev => {
   const pin = ev.target.closest('[data-pin]');
   if (pin) {
     const id = pin.dataset.pin; pins.has(id) ? pins.delete(id) : pins.add(id); render(); ev.stopPropagation();
-    fetch('api/pins', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, pins: [...pins]})});
+    fetch('api/pins', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, pins: [...pins], rev: ++pinRev})});
     return;
   }
   const c = ev.target.closest('.cell.evid');
@@ -521,9 +521,9 @@ function handle(ev) {
       }
       document.querySelector('.a.pending')?.remove();
       chat(`<span class="model">${esc(ev.model)} · ${(ev.ms / 1000).toFixed(1)}s</span>` + (ev.ops || []).map(o =>
-        o.op === 'add' ? `<div class="tool"><span class="fn">add_criterion</span>("${esc(o.text)}", ${esc(Number(o.weight))})</div>` :
+        o.op === 'add' ? `<div class="tool"><span class="fn">add_criterion</span>("${esc(o.text)}", ${Number.isFinite(+o.weight) ? +o.weight : 0.5})</div>` :
         o.op === 'remove' ? `<div class="tool rm"><span class="fn">remove_criterion</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}")</div>` :
-        o.op === 'reweight' ? `<div class="tool rw"><span class="fn">reweight</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}", ${crits.find(c => c.id === o.id)?.weight} → ${esc(Number(o.weight))})</div>` :
+        o.op === 'reweight' ? `<div class="tool rw"><span class="fn">reweight</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}", ${crits.find(c => c.id === o.id)?.weight} → ${Number.isFinite(+o.weight) ? +o.weight : 'invalid, skipped'})</div>` :
         o.op === 'clock' ? `<div class="tool rw"><span class="fn">set_clock</span>("${esc(o.value)}")</div>` :
         o.op === 'calendar' ? `<div class="tool"><span class="fn">export_calendar</span>()</div>` :
         `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${md(ev.reply)}</div>`, 'a');
@@ -638,7 +638,8 @@ function handle(ev) {
     case 'fetch': {
       const doing = ev.product === 'SERP API' ? (ev.note ? `finding ${E[ev.e]?.name}'s site` : `SERP API: ${ev.target}`) :
         ev.product === 'Web Unlocker' ? `reading ${host(ev.target)}` : `rendering ${host(ev.target)} in browser`;
-      if (ev.e && ev.c) setTimeout(() => { const c = cells[ev.e + '|' + ev.c]; if (c && !['gap', 'route'].includes(c.state)) return; setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
+      const v0 = view;
+      if (ev.e && ev.c) setTimeout(() => { if (v0 !== view) return; const c = cells[ev.e + '|' + ev.c]; if (c && !['gap', 'route'].includes(c.state)) return; setCell(ev.e, ev.c, {state: 'fetch', doing}); render(); }, 900);
       trace(s, 'bd', `${esc(ev.product)} → ${esc(ev.target)}`); status(doing + ` (for ${E[ev.e]?.name})`, 1, `Bright Data ${ev.product}`);
       break;
     }
@@ -658,8 +659,9 @@ function handle(ev) {
 }
 
 let ctrl = null;
+let switching = false, pinRev = 0;
 async function send(text) {
-  if (!text.trim()) return;
+  if (!text.trim() || switching) return;
   if (busy && ctrl) { ctrl.abort(); document.querySelector('.a.pending')?.remove(); }
   busy = true; t0 = Date.now() / 1000;
   if (!location.hash.includes(sid)) history.replaceState(null, '', '#s=' + sid);
@@ -713,7 +715,10 @@ $('#sidebg').addEventListener('click', closeSide);
 $('#sesslist').addEventListener('click', e => { const x = e.target.closest('[data-session]'); if (x) { closeSide(); loadSession(x.dataset.session); } });
 $('#newsess').addEventListener('click', () => { history.replaceState(null, '', location.pathname); location.reload(); });
 async function loadSession(id) {
-  const t = Date.now(), mine = ++view;
+  const t = Date.now(), mine = ++view; switching = true;
+  try { await restore(id, t, mine); } finally { if (mine === view) switching = false; }
+}
+async function restore(id, t, mine) {
   if (ctrl) { ctrl.abort(); ctrl = null; }
   busy = false; tfBox = null; document.querySelector('.a.pending')?.remove();
   await entitiesReady;
@@ -721,7 +726,7 @@ async function loadSession(id) {
   if (mine !== view) return;
   sid = d.sid; history.replaceState(null, '', '#s=' + sid); crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
   Object.keys(why).forEach(k => delete why[k]);
-  d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, state: 'done'}));
+  d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, calls: c.calls || null, state: 'done'}));
   $('#log').innerHTML = ''; Object.values(rowEls).forEach(el => el.remove()); for (const k in rowEls) delete rowEls[k];
   d.turns.forEach(x => { chat(esc(x.text), 'u'); if (x.reply) chat(`<span class="model">from graph memory</span><div class="reply">${md(x.reply)}</div>`, 'a'); });
   $('#empty').style.display = 'none'; renderHead(); render(); refreshGraph();

@@ -238,6 +238,7 @@ class Session:
         self.scope = "all"
         self.cells: dict[tuple[str, str], dict] = {}
         self.tried: dict[tuple[str, str], list] = {}
+        self.reworded: set[str] = set()
         self.history: list[dict] = []
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.ops: list[dict] = []
@@ -269,7 +270,8 @@ class Session:
         if not pos and self.criteria:
             cells = [(-c["weight"], self.cells.get((eid, cid))) for cid, c in self.criteria.items()]
             got = [(w, cell["p"]) for w, cell in cells if cell]
-            return sum(w * (1 - p) for w, p in got) / sum(w for w, _ in cells) if got else 0.0
+            den = sum(w for w, _ in cells)
+            return sum(w * (1 - p) for w, p in got) / den if got and den > 0 else 0.0
         pos = pos or 1.0
         s = 0.0
         for cid, c in self.criteria.items():
@@ -483,8 +485,7 @@ async def apply_ops(session: Session, ops: list[dict]):
             if old and old["text"] != op["text"].strip():
                 for k in [k for k in session.cells if k[1] == cid]:
                     del session.cells[k]
-                await gw(events, "reword", "MATCH (c:Criterion {id:$cid}) SET c.text=$text WITH c "
-                         "OPTIONAL MATCH ()-[s:SCORED]->(c) DELETE s", {"cid": cid, "text": op["text"]}, crit=cid)
+                session.reworded.add(cid)
             session.criteria[cid] = {"id": cid, "text": op["text"].strip(), "weight": w}
             cy = ("MERGE (u:User {id:$sid}) MERGE (c:Criterion {id:$cid}) ON CREATE SET c.text=$text "
                   "MERGE (u)-[r:WANTS]->(c) SET r.weight=$w")
@@ -515,10 +516,7 @@ async def apply_ops(session: Session, ops: list[dict]):
                 pass
         elif kind == "calendar":
             session.want_calendar = True
-            items = plan(session)
-            events.append(ev("calendar", url=f"api/calendar.ics?sid={session.sid}",
-                             items=[{"title": i["title"], "start": i["start"].strftime("%a %-I:%M %p"),
-                                     "where": i["where"]} for i in items]))
+            events.append(ev("note", text="Calendar will be built once this turn's scoring finishes."))
     return events
 
 
@@ -649,6 +647,7 @@ async def score_cells(session: Session, crits: list[str], ents: list[dict]):
 
 
 async def recall(session: Session, crits: list[str]):
+    crits = [c for c in crits if c not in session.reworded]
     cy = ("MATCH (e:Entity)-[s:SCORED]->(c:Criterion) WHERE c.id IN $ids "
           "OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) WHERE (x)-[:INFORMS]->(c) "
           "WITH e, c, s, x ORDER BY x.at DESC "
@@ -680,7 +679,7 @@ def site_matches(e: dict, page: str) -> bool:
     text = page.lower()
     if len(text) < 2000 or len(words) < 4:
         return True
-    return sum(1 for w in set(words) if w in text) >= 1
+    return sum(1 for w in set(words) if w in text) >= (2 if len(set(words)) >= 8 else 1)
 
 
 _site_locks: dict[str, asyncio.Lock] = {}

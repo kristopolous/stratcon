@@ -223,7 +223,7 @@ async def enrich(id: str):
            "product": "SERP API", "cached": False,
            "linkedin": hit["link"] if hit else "", "headline": (hit["title"] + " — " + hit["description"])[:300] if hit else "",
            "other": [{"title": x["title"], "url": x["link"], "snippet": x["description"][:200]} for x in socials]}
-    if True:
+    if r1.get("status") == 200 and r2.get("status") == 200:
         await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
                         {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
                          "ms": max(r1["ms"], r2["ms"])})
@@ -299,10 +299,13 @@ async def _linkedin(id: str, url: str) -> dict:
             if job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
                 sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
                 job.update({"snapshot": sid, "started": _t.time(), "retried": True})
+                await engine.gq("MATCH (p {id:$id}) SET p.li_pending=$s, p.li_pending_at=timestamp()", {"id": id, "s": sid})
             if job["status"] == "running":
                 prog = await brightdata.snapshot_progress(job["snapshot"])
                 st = prog.get("status")
-                if st == "failed" or prog.get("errors") and not prog.get("records"):
+                if prog.get("transient"):
+                    pass
+                elif st == "failed" or prog.get("errors") and not prog.get("records"):
                     job["status"], job["error"] = "failed", str(prog.get("error") or prog.get("errors"))[:200]
                 elif st == "ready":
                     recs = await brightdata.snapshot_download(job["snapshot"])
@@ -326,9 +329,12 @@ async def _linkedin(id: str, url: str) -> dict:
                         if photo and id in engine.ENTITIES:
                             engine.ENTITIES[id]["logo"] = photo
         except Exception as x:
-            job = job or {"snapshot": None, "started": _t.time()}
-            job["status"], job["error"] = "failed", f"{type(x).__name__}: {str(x)[:160]}"
-            LI_JOBS[id] = job
+            if job and job.get("snapshot"):  # transient: keep polling the same snapshot next time
+                job["error"] = f"{type(x).__name__}: {str(x)[:160]}"
+            else:
+                job = {"snapshot": None, "started": _t.time(), "status": "failed",
+                       "error": f"{type(x).__name__}: {str(x)[:160]}"}
+                LI_JOBS[id] = job
         if job["status"] == "failed":
             await engine.gq("MATCH (p {id:$id}) SET p.li_pending=null", {"id": id})
     return {"product": "Web Scraper API · LinkedIn people profiles", "dataset": "gd_l1viktl72bvl7bjuj0",
@@ -383,7 +389,7 @@ async def session_load(sid: str):
     cy1 = ("MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) "
            "RETURN u.scope, u.pins, u.now, c.id, c.text, w.weight")
     rows, ms1 = await engine.gq(cy1, {"sid": sid})
-    for scope, pins, now, cid, text, w in rows:
+    for scope, pins, now, cid, text, w in ([] if s is live else rows):
         s.scope = scope or "all"
         s.pins = [p for p in (pins or []) if p in engine.ENTITIES]
         if now:
@@ -391,7 +397,12 @@ async def session_load(sid: str):
             s.now = datetime.fromisoformat(now)
         if cid:
             s.criteria[cid] = {"id": cid, "text": text, "weight": w}
-    cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
+    if s is live:
+        cells = [{"e": e, "c": c, "p": round(v["p"], 4), "src": v.get("src"), "evidence": v.get("evidence"),
+                  "calls": v.get("calls")} for (e, c), v in s.cells.items() if c in s.criteria]
+        cy2, ms2 = "", 0
+    else:
+        cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
     cy3 = "MATCH (t:Turn)-[:IN]->(:User {id:$sid}) RETURN t.text, t.reply ORDER BY t.at"
     turns, ms3 = await engine.gq(cy3, {"sid": sid})
     if s is not live:
@@ -406,6 +417,10 @@ async def session_load(sid: str):
 async def save_pins(req: Request):
     body = await req.json()
     s = session(body["sid"])
+    rev = int(body.get("rev", 0))
+    if rev and rev < getattr(s, "pin_rev", 0):
+        return JSONResponse({"ok": False, "stale": True, "pins": s.pins})
+    s.pin_rev = rev
     s.pins = [p for p in body.get("pins", []) if p in engine.ENTITIES]
     await engine.gq("MERGE (u:User {id:$sid}) SET u.pins = $pins", {"sid": body["sid"], "pins": s.pins})
     return JSONResponse({"ok": True, "pins": s.pins})

@@ -5,6 +5,7 @@ import time
 import urllib.parse
 
 import httpx
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 import cache
@@ -127,7 +128,7 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
             res = await asyncio.wait_for(_browser(url, scroll, links_text, click_text, clicks, wait_text),
                                          TIMEOUT if not clicks else TIMEOUT * 2)
             break
-        except (asyncio.TimeoutError, httpx.TransportError, ConnectionError):
+        except (asyncio.TimeoutError, httpx.TransportError, ConnectionError, PlaywrightError):
             if attempt == 1:
                 raise
     res["variant"] = variant
@@ -194,7 +195,9 @@ async def snapshot_progress(snapshot_id: str) -> dict:
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{API}/datasets/v3/progress/{snapshot_id}", headers=HDR)
         if r.status_code != 200:
-            return {"status": "failed", "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+            return {"status": "running", "transient": r.status_code == 429 or r.status_code >= 500,
+                    "error": f"HTTP {r.status_code}: {r.text[:160]}"} if r.status_code == 429 or r.status_code >= 500 \
+                else {"status": "failed", "error": f"HTTP {r.status_code}: {r.text[:160]}"}
         return r.json()
 
 
