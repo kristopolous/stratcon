@@ -228,7 +228,8 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u || ''; } };
 const STRAT = {web_search: 'search', read_site: 'read site', render_browser: 'render', people_search: 'people'};
 
-fetch('api/entities').then(r => r.json()).then(list => {
+let view = 0;
+const entitiesReady = fetch('api/entities').then(r => r.json()).then(list => {
   list.forEach(e => E[e.id] = e);
   const n = k => list.filter(e => e.kind === k).length;
   $('#meta').textContent = `GitHub Universe 2026 · ${n('sponsor')} sponsor booths · ${n('talk')} talks · ${n('speaker') + n('person')} people`;
@@ -338,7 +339,11 @@ function doRender() {
 
 $('#rows').addEventListener('click', ev => {
   const pin = ev.target.closest('[data-pin]');
-  if (pin) { const id = pin.dataset.pin; pins.has(id) ? pins.delete(id) : pins.add(id); render(); ev.stopPropagation(); return; }
+  if (pin) {
+    const id = pin.dataset.pin; pins.has(id) ? pins.delete(id) : pins.add(id); render(); ev.stopPropagation();
+    fetch('api/pins', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sid, pins: [...pins]})});
+    return;
+  }
   const c = ev.target.closest('.cell.evid');
   if (!c) { const row = ev.target.closest('.row'); if (row && row.dataset.id) openEntity(row.dataset.id); return; }
   const [eid, cid] = c.dataset.k.split('|'), x = cells[c.dataset.k], cr = crits.find(k => k.id === cid), e = E[eid];
@@ -355,7 +360,9 @@ $('#drawer').addEventListener('click', e => {
   const tp = e.target.closest('[data-topic]'); if (tp) { focusNode('t:' + tp.dataset.topic); openTopic(tp.dataset.topic); }
 });
 async function openEntity(id) {
+  const mine = view;
   const d = await (await fetch(`api/entity?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  if (mine !== view) return;
   if (d.error) return;
   const e = d.entity, kind = e.kind === 'talk' ? `${e.tier || 'Talk'} · ${e.when}${e.room ? ' · ' + e.room : ''}` : e.kind === 'speaker' ? `Featured speaker · ${e.org}` : e.kind === 'person' ? `${e.tier} · ${e.org} · presenting` : `${e.tier} sponsor`;
   const host2 = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch { return u; } };
@@ -426,7 +433,9 @@ function clearFocus() {
 }
 svg.on('click', () => clearFocus());
 async function openCriterion(id) {
+  const mine = view;
   const d = await (await fetch(`api/criterion?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  if (mine !== view) return;
   focusSet = new Set([...(focusSet || []), ...d.best.filter(b => b.p >= .5).map(b => b.id)]); render();
   $('#dbox').innerHTML = `<h3>“${esc(d.text)}”</h3><div class="sub">criterion · weight ${d.weight}</div>
     <div class="dsec">maps to topics (FalkorDB MAPS_TO)</div>${d.topics.map(t => `<div class="dl link" data-topic="${esc(t.id)}">${esc(t.name)} <span class="dim">${t.p.toFixed(2)}</span></div>`).join('') || '<div class="dl dim">none</div>'}
@@ -435,10 +444,12 @@ async function openCriterion(id) {
   $('#drawer').classList.add('on');
 }
 async function openTopic(id) {
+  const mine = view;
   const d = await (await fetch(`api/topic?sid=${sid}&id=${encodeURIComponent(id)}`)).json();
+  if (mine !== view) return;
   focusSet = new Set([...(focusSet || []), ...d.entities.map(x => x.id)]); render();
   const groups = {sponsor: 'booths', talk: 'talks', speaker: 'featured speakers', person: 'people'};
-  $('#dbox').innerHTML = `<h3>${esc(d.name)}</h3><div class="sub">topic · ${d.entities.length} connected in the graph · click any to drill in</div>` +
+  $('#dbox').innerHTML = `<h3>${esc(d.name)}</h3><div class="sub">topic · ${d.total} connected in the graph${d.total > d.entities.length ? ` (showing ${d.entities.length})` : ''} · click any to drill in</div>` +
     Object.entries(groups).map(([k, label]) => { const xs = d.entities.filter(x => x.kind === k); return xs.length ? `<div class="dsec">${label}</div>` +
       xs.map(x => `<div class="dl link" data-open="${esc(x.id)}">${esc(x.name)} <span class="dim">${x.score > 0 ? 'score ' + (x.score * 100).toFixed(0) + ' · ' : ''}covers ${x.p.toFixed(2)}</span></div>`).join('') : ''; }).join('') +
     `<div class="dsec">FalkorDB query</div><div class="dl"><code style="font:11px var(--mono);color:#9fb0c8">${esc(d.cypher)}</code> <span class="dim">${d.ms}ms</span></div>`;
@@ -697,8 +708,12 @@ $('#sidebg').addEventListener('click', closeSide);
 $('#sesslist').addEventListener('click', e => { const x = e.target.closest('[data-session]'); if (x) { closeSide(); loadSession(x.dataset.session); } });
 $('#newsess').addEventListener('click', () => { history.replaceState(null, '', location.pathname); location.reload(); });
 async function loadSession(id) {
-  const t = Date.now();
+  const t = Date.now(), mine = ++view;
+  if (ctrl) { ctrl.abort(); ctrl = null; }
+  busy = false; tfBox = null; document.querySelector('.a.pending')?.remove();
+  await entitiesReady;
   const d = await (await fetch(`api/session/load?sid=${encodeURIComponent(id)}`)).json();
+  if (mine !== view) return;
   sid = d.sid; history.replaceState(null, '', '#s=' + sid); crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
   Object.keys(why).forEach(k => delete why[k]);
   d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, state: 'done'}));
@@ -726,7 +741,7 @@ async function lookupPeople() {
     if (pr) trace('', 'bd', `LinkedIn ✓ ${esc(pr.name || E[r.id].name)}${pr.company ? ' · ' + esc(pr.company) : ''}${pr.photo ? ' · photo' : ''}`);
   }
 }
-if (resumeOnLoad) setTimeout(() => loadSession(sid), 0);
+if (resumeOnLoad) entitiesReady.then(() => loadSession(sid));
 function offerNext() {
   if (nextI >= NEXT.length) return;
   const b = document.createElement('button'); b.className = 'next'; b.textContent = NEXT[nextI];
