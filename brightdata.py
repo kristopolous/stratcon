@@ -1,4 +1,5 @@
 """Real Bright Data calls. Each returns what happened: product, target, bytes, ms, and the payload."""
+import asyncio
 import json
 import time
 import urllib.parse
@@ -14,13 +15,29 @@ HDR = {"Authorization": f"Bearer {config.BRIGHT_DATA_KEY}", "Content-Type": "app
 _browser_ws = None
 
 
+TIMEOUT = 120
+TRIES = 3
+
+
 async def _request(url: str, data_format: str | None) -> tuple[int, str]:
+    """One Bright Data /request, reissued when it stalls past TIMEOUT seconds or the service hiccups."""
     body = {"zone": config.UNLOCKER_ZONE, "url": url, "format": "raw"}
     if data_format:
         body["data_format"] = data_format
-    async with httpx.AsyncClient(timeout=90) as c:
-        r = await c.post(f"{API}/request", headers=HDR, json=body)
+    last = (0, "no attempt")
+    for attempt in range(TRIES):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=20)) as c:
+                r = await c.post(f"{API}/request", headers=HDR, json=body)
+        except (httpx.TimeoutException, httpx.TransportError) as x:
+            last = (0, f"{type(x).__name__} after attempt {attempt + 1}")
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            last = (r.status_code, r.text)
+            await asyncio.sleep(2 * (attempt + 1))
+            continue
         return r.status_code, r.text
+    return last
 
 
 def _cached(product: str, target: str):
@@ -95,7 +112,14 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
                   click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
     if not clicks and (hit := _cached("Browser API", url)):
         return hit
-    res = await _browser(url, scroll, links_text, click_text, clicks, wait_text)
+    for attempt in range(2):
+        try:
+            res = await asyncio.wait_for(_browser(url, scroll, links_text, click_text, clicks, wait_text),
+                                         TIMEOUT if not clicks else TIMEOUT * 2)
+            break
+        except (asyncio.TimeoutError, Exception):
+            if attempt == 1:
+                raise
     return _store(res) if not clicks else res
 
 
