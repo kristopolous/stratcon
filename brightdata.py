@@ -117,7 +117,7 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
             res = await asyncio.wait_for(_browser(url, scroll, links_text, click_text, clicks, wait_text),
                                          TIMEOUT if not clicks else TIMEOUT * 2)
             break
-        except (asyncio.TimeoutError, Exception):
+        except (asyncio.TimeoutError, httpx.TransportError, ConnectionError):
             if attempt == 1:
                 raise
     return _store(res) if not clicks else res
