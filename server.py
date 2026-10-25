@@ -184,11 +184,12 @@ async def enrich(id: str):
         return JSONResponse({"error": "not a person"}, status_code=400)
     rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials, p.li_profile, "
                               "p.li_snapshot, p.li_ms, p.photo, p.photo_src", {"id": id})
-    if rows and (rows[0][0] or rows[0][3]):
+    if rows and (rows[0][0] or rows[0][3] is not None):
         out = {"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
                "other": json.loads(rows[0][3]) if rows[0][3] else []}
         if rows[0][7]:
-            out["photo"] = {"url": rows[0][7], "source": rows[0][8] or "LinkedIn", "product": "graph memory"}
+            src = rows[0][8] or "LinkedIn"
+            out["photo"] = {"url": rows[0][7], "source": src, "product": "graph memory"}
         elif out["other"]:
             gh = await _github_photo(id, [o["url"] for o in out["other"]])
             if gh:
@@ -215,11 +216,11 @@ async def enrich(id: str):
            "product": "SERP API", "cached": False,
            "linkedin": hit["link"] if hit else "", "headline": (hit["title"] + " — " + hit["description"])[:300] if hit else "",
            "other": [{"title": x["title"], "url": x["link"], "snippet": x["description"][:200]} for x in socials]}
-    if hit or socials:
+    if True:
         await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
                         {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
                          "ms": max(r1["ms"], r2["ms"])})
-    gh = await _github_photo(id, [x["link"] for x in r2["results"]] + [x["url"] for x in out["other"]])
+    gh = await _github_photo(id, [x["url"] for x in out["other"]])
     if gh:
         out["photo"] = gh
     if hit:
@@ -231,56 +232,101 @@ LI_JOBS: dict[str, dict] = {}
 
 
 async def _github_photo(id: str, links: list[str]) -> dict | None:
-    """Bright Data Web Unlocker on the person's GitHub profile; the avatar is public even when LinkedIn's isn't."""
+    """Bright Data Web Unlocker on the person's GitHub profile; the avatar is public even when LinkedIn's isn't.
+    Only a profile whose page names this person is accepted."""
     import re as _re
     import brightdata
-    user = next((m.group(1) for l in links if (m := _re.match(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?$", l))
-                 and m.group(1).lower() not in ("orgs", "topics", "features", "about", "github")), None)
-    if not user:
-        return None
-    r = await brightdata._request(f"https://github.com/{user}", None)
-    m = _re.search(r"https://avatars\.githubusercontent\.com/u/\d+\?v=\d+", r[1]) if r[0] == 200 else None
-    if not m:
-        return None
-    out = {"url": m.group(0) + "&s=200", "source": f"github.com/{user}", "product": "Web Unlocker"}
-    await engine.gq("MATCH (p {id:$id}) SET p.photo = CASE WHEN p.photo IS NULL OR p.photo = '' THEN $u ELSE p.photo END, "
-                    "p.photo_src = CASE WHEN p.photo_src IS NULL THEN $src ELSE p.photo_src END",
-                    {"id": id, "u": out["url"], "src": out["source"]})
-    if id in engine.ENTITIES and not engine.ENTITIES[id].get("logo"):
-        engine.ENTITIES[id]["logo"] = out["url"]
-    return out
+    e = engine.ENTITIES.get(id) or {}
+    name = (e.get("name") or "").lower()
+    last = name.split()[-1] if name else ""
+    users = []
+    for l in links:
+        l = l.strip()
+        if not l.startswith("http"):
+            l = "https://" + l.lstrip("/")
+        m = _re.match(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?(?:[?#].*)?$", l)
+        if m and m.group(1).lower() not in ("orgs", "topics", "features", "about", "github", "sponsors", "settings") \
+                and m.group(1) not in users:
+            users.append(m.group(1))
+    for user in users[:2]:
+        try:
+            status, html = await brightdata._request(f"https://github.com/{user}", None)
+        except Exception:
+            return None
+        if status != 200 or (last and last not in html.lower()):
+            continue
+        m = _re.search(r"https://avatars\.githubusercontent\.com/u/\d+\?v=\d+", html)
+        if not m:
+            continue
+        out = {"url": m.group(0) + "&s=200", "source": f"github.com/{user}", "product": "Web Unlocker"}
+        await engine.gq("MATCH (p {id:$id}) SET p.photo = CASE WHEN p.photo IS NULL OR p.photo = '' THEN $u ELSE p.photo END, "
+                        "p.photo_src = CASE WHEN p.photo IS NULL OR p.photo = '' OR p.photo = $u THEN $src ELSE p.photo_src END",
+                        {"id": id, "u": out["url"], "src": out["source"]})
+        if id in engine.ENTITIES and not engine.ENTITIES[id].get("logo"):
+            engine.ENTITIES[id]["logo"] = out["url"]
+        return out
+    return None
+
+
+LI_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 async def _linkedin(id: str, url: str) -> dict:
-    """Bright Data Web Scraper API, LinkedIn people profiles: trigger once, then report progress until ready."""
+    """Bright Data Web Scraper API, LinkedIn people profiles: trigger once (resuming a snapshot saved in the graph
+    after a restart), report progress until ready or failed, never trigger two scrapes for one person."""
     import time as _t
     import brightdata
-    job = LI_JOBS.get(id)
-    if job and job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
-        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
-        job.update({"snapshot": sid, "started": _t.time(), "retried": True})
-    if not job:
-        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
-        job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
-    if job["status"] == "running":
-        prog = await brightdata.snapshot_progress(job["snapshot"])
-        job["status"] = {"ready": "ready", "failed": "failed"}.get(prog.get("status"), "running")
-        if job["status"] == "ready":
-            rec = (await brightdata.snapshot_download(job["snapshot"]))[0]
-            photo = "" if rec.get("default_avatar") else (rec.get("avatar") or "")
-            comp = rec.get("current_company") or {}
-            job["profile"] = {"name": rec.get("name"), "photo": photo, "about": (rec.get("about") or "")[:400],
-                              "company": comp.get("name") if isinstance(comp, dict) else rec.get("current_company_name"),
-                              "city": rec.get("city"), "followers": rec.get("followers"), "url": rec.get("url") or url,
-                              "position": rec.get("position")}
-            job["ms"] = int((_t.time() - job["started"]) * 1000)
-            await engine.gq("MATCH (p {id:$id}) SET p.li_profile=$j, p.photo=$ph, p.li_snapshot=$sid, p.li_ms=$ms",
+    async with LI_LOCKS.setdefault(id, asyncio.Lock()):
+        job = LI_JOBS.get(id)
+        try:
+            if not job:
+                rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.li_pending, p.li_pending_at", {"id": id})
+                if rows and rows[0][0]:
+                    job = LI_JOBS[id] = {"snapshot": rows[0][0], "started": (rows[0][1] or _t.time() * 1000) / 1000,
+                                         "status": "running", "url": url}
+                else:
+                    sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
+                    job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
+                    await engine.gq("MATCH (p {id:$id}) SET p.li_pending=$s, p.li_pending_at=timestamp()",
+                                    {"id": id, "s": sid})
+            if job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
+                sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
+                job.update({"snapshot": sid, "started": _t.time(), "retried": True})
+            if job["status"] == "running":
+                prog = await brightdata.snapshot_progress(job["snapshot"])
+                st = prog.get("status")
+                if st == "failed" or prog.get("errors") and not prog.get("records"):
+                    job["status"], job["error"] = "failed", str(prog.get("error") or prog.get("errors"))[:200]
+                elif st == "ready":
+                    recs = await brightdata.snapshot_download(job["snapshot"])
+                    rec = recs[0] if recs and isinstance(recs[0], dict) else {}
+                    if not rec or rec.get("error") or not rec.get("name"):
+                        job["status"], job["error"] = "failed", str(rec.get("error") or "no profile returned")[:200]
+                    else:
+                        photo = "" if rec.get("default_avatar") else (rec.get("avatar") or "")
+                        comp = rec.get("current_company") or {}
+                        job["profile"] = {"name": rec.get("name"), "photo": photo, "about": (rec.get("about") or "")[:400],
+                                          "company": comp.get("name") if isinstance(comp, dict) else rec.get("current_company_name"),
+                                          "city": rec.get("city"), "followers": rec.get("followers"),
+                                          "url": rec.get("url") or url, "position": rec.get("position")}
+                        job["status"] = "ready"
+                        job["ms"] = int((_t.time() - job["started"]) * 1000)
+                        await engine.gq(
+                            "MATCH (p {id:$id}) SET p.li_profile=$j, p.li_snapshot=$sid, p.li_ms=$ms, p.li_pending=null, "
+                            "p.photo = CASE WHEN $ph <> '' THEN $ph ELSE p.photo END, "
+                            "p.photo_src = CASE WHEN $ph <> '' THEN 'LinkedIn' ELSE p.photo_src END",
                             {"id": id, "j": json.dumps(job["profile"]), "ph": photo, "sid": job["snapshot"], "ms": job["ms"]})
-            if photo and id in engine.ENTITIES:
-                engine.ENTITIES[id]["logo"] = photo
+                        if photo and id in engine.ENTITIES:
+                            engine.ENTITIES[id]["logo"] = photo
+        except Exception as x:
+            job = job or {"snapshot": None, "started": _t.time()}
+            job["status"], job["error"] = "failed", f"{type(x).__name__}: {str(x)[:160]}"
+            LI_JOBS[id] = job
+        if job["status"] == "failed":
+            await engine.gq("MATCH (p {id:$id}) SET p.li_pending=null", {"id": id})
     return {"product": "Web Scraper API · LinkedIn people profiles", "dataset": "gd_l1viktl72bvl7bjuj0",
-            "snapshot": job["snapshot"], "status": job["status"], "elapsed": int(_t.time() - job["started"]),
-            "profile": job.get("profile"), "ms": job.get("ms")}
+            "snapshot": job.get("snapshot"), "status": job["status"], "elapsed": int(_t.time() - job["started"]),
+            "profile": job.get("profile"), "ms": job.get("ms"), "error": job.get("error")}
 
 
 @app.get("/api/topic")

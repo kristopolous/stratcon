@@ -40,8 +40,8 @@ async def _request(url: str, data_format: str | None) -> tuple[int, str]:
     return last
 
 
-def _cached(product: str, target: str):
-    hit = cache.get("brightdata", cache.key(product, target))
+def _cached(product: str, target: str, variant: str = ""):
+    hit = cache.get("brightdata", cache.key(product, target, variant))
     if hit:
         return {**hit, "cached": True}
     return None
@@ -49,7 +49,8 @@ def _cached(product: str, target: str):
 
 def _store(res: dict) -> dict:
     if res.get("status") == 200 and (res.get("text") or res.get("results")):
-        cache.put("brightdata", cache.key(res["product"], res["target"]), {**res, "text": (res.get("text") or "")[:60000]})
+        cache.put("brightdata", cache.key(res["product"], res["target"], res.get("variant", "")),
+                  {**res, "text": (res.get("text") or "")[:400000]})
     return res
 
 
@@ -110,7 +111,8 @@ async def _ws() -> str:
 
 async def browser(url: str, scroll: int = 2, links_text: str | None = None,
                   click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
-    if not clicks and (hit := _cached("Browser API", url)):
+    variant = f"scroll={scroll};links={links_text};wait={wait_text}"
+    if not clicks and (hit := _cached("Browser API", url, variant)):
         return hit
     for attempt in range(2):
         try:
@@ -120,6 +122,7 @@ async def browser(url: str, scroll: int = 2, links_text: str | None = None,
         except (asyncio.TimeoutError, httpx.TransportError, ConnectionError):
             if attempt == 1:
                 raise
+    res["variant"] = variant
     return _store(res) if not clicks else res
 
 
@@ -182,6 +185,8 @@ async def dataset_trigger(dataset_id: str, inputs: list[dict]) -> str:
 async def snapshot_progress(snapshot_id: str) -> dict:
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{API}/datasets/v3/progress/{snapshot_id}", headers=HDR)
+        if r.status_code != 200:
+            return {"status": "failed", "error": f"HTTP {r.status_code}: {r.text[:160]}"}
         return r.json()
 
 

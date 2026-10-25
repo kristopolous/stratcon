@@ -104,11 +104,11 @@ ACTIVE = None
 
 async def load_entities():
     rows, _ = await gq("MATCH (e:Entity) RETURN e.id, e.kind, e.name, e.tier, e.description, e.url, e.org, "
-                       "e.when, e.room, e.logo, e.speakers")
+                       "e.when, e.room, e.logo, e.speakers, e.photo")
     ENTITIES.clear()
-    for i, k, n, t, d, u, o, w, r, lg, sp in rows:
+    for i, k, n, t, d, u, o, w, r, lg, sp, ph in rows:
         ENTITIES[i] = {"id": i, "kind": k, "name": n, "tier": t, "description": d, "url": u or "", "org": o or "",
-                       "when": w or "", "room": r or "", "logo": lg or "", "speakers": sp or ""}
+                       "when": w or "", "room": r or "", "logo": ph or lg or "", "speakers": sp or ""}
 
 
 # Mirrors storyclass.py: every request declares num_ctx (top level, next to keep_alive), stays inside a
@@ -781,7 +781,8 @@ async def rescore(session: Session, g: dict, snippet: str, url: str, product: st
 
 
 async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
-    for attempt in range(2):
+    # Keep retrying with a different Bright Data strategy until one yields evidence or all have been tried.
+    for attempt in range(len(STRATEGIES)):
         if attempt:
             ms = await route(session, [g])
             if not g["strategy"]:
@@ -797,7 +798,7 @@ async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
         if ok:
             await rescore(session, g, snippet, url, product, out, calls)
             return
-    await out.put(ev("unresolved", e=g["e"], c=g["c"]))
+    await out.put(ev("unresolved", e=g["e"], c=g["c"], tries=len(session.tried.get((g["e"], g["c"]), []))))
 
 
 WHY_PATH = ("MATCH (u:User {id:$sid}), (e:Entity {id:$id}) "

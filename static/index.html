@@ -282,7 +282,7 @@ function cellHTML(eid, c) {
   if (x.state === 'fetch') return `<div class="cell fetch"><span class="v" style="color:var(--gap)">? ${p.toFixed(2)}</span><span class="tag">${esc(x.doing)}</span></div>`;
   const cls = ['cell', p < .5 ? 'low' : '', x.src === 'memory' && x.fresh ? 'mem' : '', x.evidence ? 'evid' : '', x.state === 'fail' ? 'fail' : ''].join(' ');
   const delta = x.before != null ? `<span class="delta ${p >= x.before ? 'up' : 'dn'}">${p >= x.before ? '+' : ''}${(p - x.before).toFixed(2)}</span>` : '';
-  const tag = x.evidence ? `${host(x.evidence.url) || x.evidence.product}` : x.src === 'memory' && x.fresh ? 'from graph' : x.state === 'fail' ? 'unresolved' : '';
+  const tag = x.evidence ? `${host(x.evidence.url) || x.evidence.product}` : x.src === 'memory' && x.fresh ? 'from graph' : x.state === 'fail' ? `unresolved after ${x.tries || 1} ${x.tries > 1 ? 'tries' : 'try'}` : '';
   return `<div class="${cls}" data-k="${eid}|${c.id}"><div class="bar" style="width:${x.anim ?? pct}%"></div>${delta}
     <span class="v">${p.toFixed(2)}</span>${tag ? `<span class="tag">${esc(tag)}</span>` : ''}</div>`;
 }
@@ -394,7 +394,7 @@ async function openEntity(id) {
           (pr.about ? `<div class="dl dim">${esc(pr.about)}</div>` : '') : '') +
         (p.linkedin ? `<div class="dl"><a href="${esc(p.linkedin)}" target="_blank">LinkedIn</a> · ${esc(p.headline)}</div>` : `<div class="dl dim">no LinkedIn profile found</div>`) +
         (p.other || []).map(o => `<div class="dl"><a href="${esc(o.url)}" target="_blank">${esc(host(o.url))}</a> · ${esc(o.title)} <span class="dim">${esc(o.snippet)}</span></div>`).join('') +
-        (sc ? `<div class="dl" style="font:11.5px var(--mono);color:${sc.status === 'ready' ? 'var(--yes)' : 'var(--gap)'}">Bright Data ${esc(sc.product)} · snapshot ${esc(sc.snapshot || '')} · ${sc.status === 'ready' ? (sc.cached ? 'from graph memory' : `ready in ${((sc.ms || 0) / 1000).toFixed(0)}s`) : `running ${sc.elapsed}s…`}</div>` : '') +
+        (sc ? `<div class="dl" style="font:11.5px var(--mono);color:${sc.status === 'ready' ? 'var(--yes)' : sc.status === 'failed' ? '#e5636b' : 'var(--gap)'}">Bright Data ${esc(sc.product)} · snapshot ${esc(sc.snapshot || '')} · ${sc.status === 'ready' ? (sc.cached ? 'from graph memory' : `ready in ${((sc.ms || 0) / 1000).toFixed(0)}s`) : sc.status === 'failed' ? `failed: ${esc(sc.error || '')}` : `running ${sc.elapsed}s…`}</div>` : '') +
         (p.photo ? `<div class="dl" style="font:11.5px var(--mono);color:var(--yes)">photo: Bright Data ${esc(p.photo.product)} · ${esc(p.photo.source)}</div>` : '') +
         (p.cached ? '' : (p.queries || []).map(q => `<div class="dl dim" style="font:11.5px var(--mono)">Bright Data SERP API · ${esc(q.q)} · ${(q.ms / 1000).toFixed(1)}s</div>`).join(''));
       if (pr && pr.photo) { E[e.id].logo = pr.photo; render(); }
@@ -599,7 +599,7 @@ function handle(ev) {
       break;
     case 'rubric': crits = ev.criteria; renderHead(); render(); break;
     case 'reweight': trace(s, 'ag', `reweight ${esc(ev.crit)} ${ev.before} → ${ev.after}`); break;
-    case 'rank': rank = ev.rows; render(); $('#calbtn').disabled = !rank.some(r => r.score > 0); break;
+    case 'rank': rank = ev.rows; render(); $('#calbtn').disabled = !rank.some(r => r.score > 0.2); break;
     case 'note': status(ev.text); trace(s, 's1', esc(ev.text)); break;
     case 'fill': status(`scoring the rest of the row for ${ev.n} new leaders`, 1); trace(s, 's1', `fill in: ${esc(ev.names.join(', '))}`); break;
     case 'memory': status(`recalled ${ev.n} scores from the graph`); trace(s, 'fk', `memory hit: ${ev.n} scores reused (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); break;
@@ -644,7 +644,7 @@ function handle(ev) {
       if (ev.ok) { setCell(ev.e, ev.c, {calls: ev.calls}); trace(s, 'bd', `${esc(ev.product)} ✓ ${ev.cached ? 'cached (fetched earlier in ' + (ev.ms / 1000).toFixed(1) + 's)' : (ev.ms / 1000).toFixed(1) + 's'} · ${(ev.bytes / 1024).toFixed(0)} KB · "${esc((ev.snippet || '').slice(0, 90))}…"`); }
       else { setCell(ev.e, ev.c, {state: 'gap'}); render(); trace(s, 'bd', `${esc(ev.product || ev.strategy)} ✗ ${ev.error ? esc(ev.error) : 'nothing relevant'} — escalating`); }
       break;
-    case 'unresolved': setCell(ev.e, ev.c, {state: 'fail'}); render(); break;
+    case 'unresolved': setCell(ev.e, ev.c, {state: 'fail', tries: ev.tries}); render(); break;
     case 'graph': if (ev.op === 'agent_query') status(`agent asked the graph: ${ev.n} rows in ${ev.ms}ms`, 1, 'FalkorDB Cypher (from TrueForge)');
       refreshGraph(); if (ev.op !== 'scored') trace(s, 'fk', `${ev.op} (${ev.ms}ms)<br><code>${esc(ev.cypher)}</code>`); else trace(s, 'fk', `wrote ${ev.n} SCORED edges (${ev.ms}ms)`); break;
     case 'aborted': trace(s, 'ag', esc(ev.text)); status(ev.text, 1, 'Redirected'); tfBox = null;
@@ -720,14 +720,14 @@ async function loadSession(id) {
   $('#log').innerHTML = ''; Object.values(rowEls).forEach(el => el.remove()); for (const k in rowEls) delete rowEls[k];
   d.turns.forEach(x => { chat(esc(x.text), 'u'); if (x.reply) chat(`<span class="model">from graph memory</span><div class="reply">${md(x.reply)}</div>`, 'a'); });
   $('#empty').style.display = 'none'; renderHead(); render(); refreshGraph();
-  $('#calbtn').disabled = !rank.some(r => r.score > 0);
+  $('#calbtn').disabled = !rank.some(r => r.score > 0.2);
   $('#drawer').classList.remove('on');
   status(`restored ${d.turns.length} turns, ${crits.length} criteria and ${d.cells.length} scores from the graph in ${Date.now() - t}ms — no model calls`, 0, 'FalkorDB · session restored');
   d.queries.forEach(q => trace('', 'fk', `restore (${q.ms}ms)<br><code>${esc(q.cypher)}</code>`));
 }
 async function lookupPeople() {
   const people = rank.filter(r => r.score > 0 && ['person', 'speaker'].includes(E[r.id]?.kind) && !(E[r.id].logo || '').includes('licdn')).slice(0, 3);
-  for (const r of people) {
+  await Promise.all(people.map(async r => {
     trace(((Date.now() / 1000) - t0).toFixed(1) + 's', 'bd', `Bright Data LinkedIn people profiles → ${esc(E[r.id].name)}`);
     let p = await (await fetch(`api/enrich?id=${encodeURIComponent(r.id)}`)).json();
     if (p.photo) { E[r.id].logo = p.photo.url; render(); }
@@ -739,7 +739,8 @@ async function lookupPeople() {
     const ph = (pr && pr.photo) || (p.photo && p.photo.url);
     if (ph) { E[r.id].logo = ph; render(); }
     if (pr) trace('', 'bd', `LinkedIn ✓ ${esc(pr.name || E[r.id].name)}${pr.company ? ' · ' + esc(pr.company) : ''}${pr.photo ? ' · photo' : ''}`);
-  }
+    else if (p.scraper && p.scraper.status === 'failed') trace('', 'bd', `LinkedIn ✗ ${esc(E[r.id].name)}: ${esc(p.scraper.error || 'failed')}`);
+  }));
 }
 if (resumeOnLoad) entitiesReady.then(() => loadSession(sid));
 function offerNext() {
