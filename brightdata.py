@@ -5,6 +5,7 @@ import time
 import urllib.parse
 
 import httpx
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 import cache
@@ -40,8 +41,8 @@ async def _request(url: str, data_format: str | None) -> tuple[int, str]:
     return last
 
 
-def _cached(product: str, target: str):
-    hit = cache.get("brightdata", cache.key(product, target))
+def _cached(product: str, target: str, variant: str = ""):
+    hit = cache.get("brightdata", cache.key(product, target, variant))
     if hit:
         return {**hit, "cached": True}
     return None
@@ -49,7 +50,8 @@ def _cached(product: str, target: str):
 
 def _store(res: dict) -> dict:
     if res.get("status") == 200 and (res.get("text") or res.get("results")):
-        cache.put("brightdata", cache.key(res["product"], res["target"]), {**res, "text": (res.get("text") or "")[:60000]})
+        cache.put("brightdata", cache.key(res["product"], res["target"], res.get("variant", "")),
+                  {**res, "text": (res.get("text") or "")[:400000]})
     return res
 
 
@@ -70,10 +72,18 @@ def _real_link(o: dict) -> str:
     link = o.get("link", "")
     if "google.com/goto" not in link and "google.com/url" not in link:
         return link
+    from urllib.parse import urlparse, parse_qs
+    qs = parse_qs(urlparse(link).query)
+    for k in ("url", "q"):
+        if qs.get(k) and qs[k][0].startswith("http"):
+            return qs[k][0]
     shown = o.get("display_link", "")
     if "…" in shown or "..." in shown:
         shown = shown.split(" › ")[0]
-    return shown.replace(" › ", "/").strip() or link
+    shown = shown.replace(" › ", "/").strip()
+    if not shown or " " in shown:
+        return link
+    return shown if shown.startswith("http") else "https://" + shown
 
 
 async def serp(query: str) -> dict:
@@ -110,16 +120,18 @@ async def _ws() -> str:
 
 async def browser(url: str, scroll: int = 2, links_text: str | None = None,
                   click_text: str | None = None, clicks: int = 0, wait_text: str | None = None) -> dict:
-    if not clicks and (hit := _cached("Browser API", url)):
+    variant = f"scroll={scroll};links={links_text};wait={wait_text}"
+    if not clicks and (hit := _cached("Browser API", url, variant)):
         return hit
     for attempt in range(2):
         try:
             res = await asyncio.wait_for(_browser(url, scroll, links_text, click_text, clicks, wait_text),
                                          TIMEOUT if not clicks else TIMEOUT * 2)
             break
-        except (asyncio.TimeoutError, Exception):
+        except (asyncio.TimeoutError, httpx.TransportError, ConnectionError, PlaywrightError):
             if attempt == 1:
                 raise
+    res["variant"] = variant
     return _store(res) if not clicks else res
 
 
@@ -182,6 +194,10 @@ async def dataset_trigger(dataset_id: str, inputs: list[dict]) -> str:
 async def snapshot_progress(snapshot_id: str) -> dict:
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{API}/datasets/v3/progress/{snapshot_id}", headers=HDR)
+        if r.status_code != 200:
+            return {"status": "running", "transient": r.status_code == 429 or r.status_code >= 500,
+                    "error": f"HTTP {r.status_code}: {r.text[:160]}"} if r.status_code == 429 or r.status_code >= 500 \
+                else {"status": "failed", "error": f"HTTP {r.status_code}: {r.text[:160]}"}
         return r.json()
 
 

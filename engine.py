@@ -1,5 +1,6 @@
 """StratCon engine. A turn is a stream of events, each one a real call that happened."""
 import asyncio
+import itertools
 import json
 import re
 import time
@@ -34,6 +35,10 @@ STRATEGIES = {
 }
 
 
+MAX_CRITERIA = 5
+MAX_TOOL_CALLS = 24
+
+
 def slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48]
 
@@ -43,22 +48,40 @@ def _reconnect():
     graph = FalkorDB.from_url(config.FALKORDB_URL).select_graph(config.GRAPH)
 
 
-async def gq(cypher: str, params: dict | None = None, timeout: float = 15):
-    t = time.time()
-    if graph is None:
-        for attempt in range(10):
+_CONNECT = asyncio.Lock()
+WRITES = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE)\b", re.I)
+
+
+async def _connect():
+    async with _CONNECT:
+        if graph is not None:
+            return
+        last = None
+        for attempt in range(5):
             try:
                 await asyncio.to_thread(_reconnect)
-                break
-            except Exception:
-                await asyncio.sleep(3)
+                return
+            except Exception as x:
+                last = x
+                print(f"FalkorDB connect attempt {attempt + 1} failed: {x}", flush=True)
+                await asyncio.sleep(2)
+        raise ConnectionError(f"FalkorDB unreachable: {last}")
+
+
+async def gq(cypher: str, params: dict | None = None, timeout: float = 15, read_only: bool = False):
+    t = time.time()
+    if graph is None:
+        await _connect()
+    run = lambda: (graph.ro_query if read_only else graph.query)(cypher, params or {})
     try:
-        res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
+        res = await asyncio.wait_for(asyncio.to_thread(run), timeout)
     except Exception as x:
         if not isinstance(x, asyncio.TimeoutError) and not any(k in str(x).lower() for k in ("pipe", "connection", "closed", "timeout")):
             raise
+        if isinstance(x, asyncio.TimeoutError) and not read_only and WRITES.search(cypher):
+            raise
         await asyncio.to_thread(_reconnect)
-        res = await asyncio.wait_for(asyncio.to_thread(graph.query, cypher, params or {}), timeout)
+        res = await asyncio.wait_for(asyncio.to_thread(run), timeout)
     return res.result_set, int((time.time() - t) * 1000)
 
 
@@ -85,7 +108,8 @@ def plan(session: "Session", talks: int = 6, booths: int = 4) -> list[dict]:
     top_booths = [ENTITIES[r["id"]] for r in ranking if ENTITIES[r["id"]]["kind"] == "sponsor"][:booths]
     if top_booths:
         slot = max(datetime(2026, 10, 28, 10, 0), session.now or datetime.min)
-        slot = slot.replace(minute=(slot.minute // 15) * 15, second=0, microsecond=0)
+        if slot.minute % 15 or slot.second or slot.microsecond:
+            slot = slot.replace(minute=(slot.minute // 15) * 15, second=0, microsecond=0) + timedelta(minutes=15)
         while any(not (slot + timedelta(minutes=45) <= c["start"] or slot >= c["end"]) for c in chosen):
             slot += timedelta(minutes=15)
         chosen.append({"title": "Expo hall: " + ", ".join(b["name"] for b in top_booths), "start": slot,
@@ -104,11 +128,11 @@ ACTIVE = None
 
 async def load_entities():
     rows, _ = await gq("MATCH (e:Entity) RETURN e.id, e.kind, e.name, e.tier, e.description, e.url, e.org, "
-                       "e.when, e.room, e.logo, e.speakers")
+                       "e.when, e.room, e.logo, e.speakers, e.photo")
     ENTITIES.clear()
-    for i, k, n, t, d, u, o, w, r, lg, sp in rows:
+    for i, k, n, t, d, u, o, w, r, lg, sp, ph in rows:
         ENTITIES[i] = {"id": i, "kind": k, "name": n, "tier": t, "description": d, "url": u or "", "org": o or "",
-                       "when": w or "", "room": r or "", "logo": lg or "", "speakers": sp or ""}
+                       "when": w or "", "room": r or "", "logo": ph or lg or "", "speakers": sp or ""}
 
 
 # Mirrors storyclass.py: every request declares num_ctx (top level, next to keep_alive), stays inside a
@@ -138,7 +162,8 @@ def payload_fits(model: str, state: str, questions: dict) -> bool:
 
 def _too_large(msg: str) -> bool:
     m = msg.lower()
-    return "too large" in m or "exceed" in m or "413" in m or "tokens) is too" in m or "batch size" in m
+    return ("too large" in m or "exceeds the context" in m or "exceeds maximum" in m or "context length" in m
+            or "tokens) is too" in m or "batch size" in m)
 
 
 async def _post(model: str, state: str, questions: dict) -> dict:
@@ -156,9 +181,12 @@ async def _post(model: str, state: str, questions: dict) -> dict:
         if r.status_code == 200:
             return r.json()["answers"]
         last = f"systemone {model} HTTP {r.status_code}: {r.text[:200]}"
+        if r.status_code == 429:
+            await asyncio.sleep(2 * attempt)
+            continue
         if r.status_code == 413 or _too_large(r.text):
             raise OverflowError(last)
-        if r.status_code == 429 or r.status_code >= 500:
+        if r.status_code >= 500:
             await asyncio.sleep(2 * attempt)
             continue
         raise RuntimeError(last)
@@ -210,6 +238,7 @@ class Session:
         self.scope = "all"
         self.cells: dict[tuple[str, str], dict] = {}
         self.tried: dict[tuple[str, str], list] = {}
+        self.reworded: set[str] = set()
         self.history: list[dict] = []
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.ops: list[dict] = []
@@ -220,6 +249,7 @@ class Session:
         self.calls: dict[str, list] = {}
         self.pins: list[str] = []
         self.last_reply = ""
+        self.tf_seeded = False
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -236,7 +266,13 @@ class Session:
         return list(ENTITIES.values())
 
     def score(self, eid: str) -> float:
-        pos = sum(c["weight"] for c in self.criteria.values() if c["weight"] > 0) or 1.0
+        pos = sum(c["weight"] for c in self.criteria.values() if c["weight"] > 0)
+        if not pos and self.criteria:
+            cells = [(-c["weight"], self.cells.get((eid, cid))) for cid, c in self.criteria.items()]
+            got = [(w, cell["p"]) for w, cell in cells if cell]
+            den = sum(w for w, _ in cells)
+            return sum(w * (1 - p) for w, p in got) / den if got and den > 0 else 0.0
+        pos = pos or 1.0
         s = 0.0
         for cid, c in self.criteria.items():
             cell = self.cells.get((eid, cid))
@@ -339,6 +375,11 @@ async def agent_trueforge(session: "Session", text: str):
     session.ops = []
     ACTIVE = session
     rubric = [{"id": k["id"], "text": k["text"], "weight": k["weight"]} for k in session.criteria.values()]
+    earlier = ""
+    if session.history and not session.tf_seeded:
+        earlier = "Earlier in this conversation:\n" + "\n".join(
+            f"{h['role']}: {h['content'][:300]}" for h in session.history[-6:]) + "\n\n"
+    session.tf_seeded = True
     reply, status = "", ""
     calls: dict[tuple, dict] = {}
     by_id: dict[str, dict] = {}
@@ -347,7 +388,7 @@ async def agent_trueforge(session: "Session", text: str):
         res = c.sessions.create_turn_stream(
             session_id=session.tf_id,
             input=[t.UserMessage(type="user.message",
-                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
+                                 content=f"{earlier}Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
                                          f"Pinned by attendee: {json.dumps([ENTITIES[p]['name'] for p in session.pins])}\n"
                                          f"Attendee says: {text}")])
         if inspect.isawaitable(res):
@@ -385,6 +426,13 @@ async def agent_trueforge(session: "Session", text: str):
                     yield ev("tf_tool_call", id=e.tool_call_id, name=c.get("tool") or c["name"], harness_tool=c["name"],
                              args=c["args"], server=c.get("server", ""))
                 yield ev("tf_tool_result", id=e.tool_call_id, content=_text(e.content)[:300])
+                if len(by_id) >= MAX_TOOL_CALLS:
+                    yield ev("note", text=f"Agent hit {MAX_TOOL_CALLS} tool calls; stopping it and ranking with the rubric so far.")
+                    try:
+                        await asyncio.wait_for(tf_client().sessions.cancel(session_id=session.tf_id), 3)
+                    except Exception:
+                        pass
+                    break
             elif kind == "turn.done":
                 status = getattr(e.state, "status", "")
             while not session.inbox.empty():
@@ -426,7 +474,18 @@ async def apply_ops(session: Session, ops: list[dict]):
         kind = op.get("op")
         if kind == "add" and op.get("text"):
             cid = slug(op["text"])
-            w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
+            try:
+                w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
+            except (TypeError, ValueError):
+                w = 0.5
+            if cid not in session.criteria and len(session.criteria) >= MAX_CRITERIA:
+                events.append(ev("note", text=f"Rubric is full ({MAX_CRITERIA} criteria); not adding “{op['text']}”."))
+                continue
+            old = session.criteria.get(cid)
+            if old and old["text"] != op["text"].strip():
+                for k in [k for k in session.cells if k[1] == cid]:
+                    del session.cells[k]
+                session.reworded.add(cid)
             session.criteria[cid] = {"id": cid, "text": op["text"].strip(), "weight": w}
             cy = ("MERGE (u:User {id:$sid}) MERGE (c:Criterion {id:$cid}) ON CREATE SET c.text=$text "
                   "MERGE (u)-[r:WANTS]->(c) SET r.weight=$w")
@@ -438,7 +497,10 @@ async def apply_ops(session: Session, ops: list[dict]):
             await gw(events, "remove", cy, {"sid": session.sid, "cid": cid}, crit=cid)
         elif kind == "reweight" and resolve_crit(session, op.get("id")):
             cid = resolve_crit(session, op.get("id"))
-            w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
+            try:
+                w = max(-1.0, min(1.0, float(op.get("weight", 0.5))))
+            except (TypeError, ValueError):
+                continue
             events.append(ev("reweight", crit=cid, before=session.criteria[cid]["weight"], after=w))
             session.criteria[cid]["weight"] = w
             cy = "MATCH (:User {id:$sid})-[r:WANTS]->(:Criterion {id:$cid}) SET r.weight=$w"
@@ -453,10 +515,8 @@ async def apply_ops(session: Session, ops: list[dict]):
             except ValueError:
                 pass
         elif kind == "calendar":
-            items = plan(session)
-            events.append(ev("calendar", url=f"api/calendar.ics?sid={session.sid}",
-                             items=[{"title": i["title"], "start": i["start"].strftime("%a %-I:%M %p"),
-                                     "where": i["where"]} for i in items]))
+            session.want_calendar = True
+            events.append(ev("note", text="Calendar will be built once this turn's scoring finishes."))
     return events
 
 
@@ -499,18 +559,17 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
         _, gms = await gq(cy, {"cid": cid, "topics": topics})
         yield ev("topics", crit=cid, model=config.ROUTER_MODEL, ms=ms, topics=[[TOPICS[x["t"]], x["p"]] for x in topics],
                  cypher=cy, gms=gms)
-        cy = ("MATCH (c:Criterion {id:$cid}), (e:Entity) "
+        cy = ("MATCH (c:Criterion {id:$cid}), (e:Entity) WHERE e.id IN $allowed "
               "WITH c, e, shortestPath((c)-[:MAPS_TO|COVERS|PRESENTED_BY|WORKS_AT|EMPLOYS|PRESENTS*..5]->(e)) AS p "
               "WHERE p IS NOT NULL "
               "RETURN e.id, length(p), reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.p, 0.6)) AS w "
               "ORDER BY length(p), w DESC LIMIT 60")
-        rows, ms = await gq(cy, {"cid": cid})
-        rows = [r for r in rows if r[0] in allowed]
+        rows, ms = await gq(cy, {"cid": cid, "allowed": list(allowed)})
         for eid, hops, w in rows:
             rel[eid] += float(w) / hops
         direct = [r for r in rows if r[1] <= 3][:RETRIEVE_PER_CRIT + 3]
         hops2 = [r for r in rows if r[1] > 3][:3]
-        keep |= {r[0] for r in direct} | {r[0] for r in hops2}
+        mine = {r[0] for r in direct} | {r[0] for r in hops2}
         yield ev("graph_search", crit=cid, cypher=cy, ms=ms, hits=len(rows),
                  direct=[ENTITIES[r[0]]["name"] for r in direct], multihop=[ENTITIES[r[0]]["name"] for r in hops2])
         q = " | ".join(keywords(text)) or text
@@ -519,12 +578,17 @@ async def score_new(session: Session, crits: list[str], only: list[dict] | None 
         rows = [r for r in rows if r[0] in allowed]
         for eid, sc in rows:
             rel[eid] += 0.2 * float(sc)
-        keep |= {r[0] for r in rows[:3]}
+        mine |= {r[0] for r in rows[:3]}
+        keep |= mine
         yield ev("fulltext", crit=cid, cypher=cy, query=q, ms=ms, hits=[ENTITIES[r[0]]["name"] for r in rows[:3]])
-        if len(keep) < 5:
+        if len(mine) < 5:
             fstate = "GitHub Universe 2026 sponsor booths, talks and people."
             finstr = f"Which one best satisfies: {text}?"
-            pool = sorted(ents, key=lambda e: e["kind"] == "talk")
+            # Interleave kinds so a budget-limited option list still covers sponsors, talks and people.
+            by_kind: dict[str, list] = {}
+            for e in sorted(ents, key=lambda e: -rel[e["id"]]):
+                by_kind.setdefault(e["kind"], []).append(e)
+            pool = [e for group in itertools.zip_longest(*by_kind.values()) for e in group if e]
             opts = {}
             for e in pool:
                 trial = {**opts, e["id"]: f"{e['name']} ({e['kind']}{', ' + e['org'] if e.get('org') else ''})"}
@@ -556,10 +620,13 @@ async def score_cells(session: Session, crits: list[str], ents: list[dict]):
         idx = {}
         for e, _ in chunk:
             idx.setdefault(e["id"], (len(idx), e))
-        state = "GitHub Universe 2026 expo hall and speakers:\n" + "\n".join(
-            f"[{i}] {e['name']} ({e['tier']}): {e['description']}" for i, e in idx.values())
         qs = {f"{idx[e['id']][0]}|{cid}": noul(f"Does [{idx[e['id']][0]}] {e['name']} satisfy: {session.criteria[cid]['text']}?")
               for e, cid in chunk}
+        for cap in (100000, 1200, 600, 300, 150):
+            state = "GitHub Universe 2026 expo hall and speakers:\n" + "\n".join(
+                f"[{i}] {e['name']} ({e['tier']}): {(e['description'] or '')[:cap]}" for i, e in idx.values())
+            if payload_fits(config.SCORE_MODEL, state, qs):
+                break
         yield ev("s1_call", model=config.SCORE_MODEL, questions=len(qs), entities=len(idx), phase="start")
         answers, ms = await systemone(config.SCORE_MODEL, state, qs)
         by_i = {i: e for i, e in idx.values()}
@@ -580,28 +647,39 @@ async def score_cells(session: Session, crits: list[str], ents: list[dict]):
 
 
 async def recall(session: Session, crits: list[str]):
+    crits = [c for c in crits if c not in session.reworded]
     cy = ("MATCH (e:Entity)-[s:SCORED]->(c:Criterion) WHERE c.id IN $ids "
           "OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) WHERE (x)-[:INFORMS]->(c) "
-          "RETURN e.id, c.id, s.p, s.ev, x.product, x.url, x.snippet")
+          "WITH e, c, s, x ORDER BY x.at DESC "
+          "WITH e, c, s, collect(x)[0] AS x "
+          "RETURN e.id, c.id, s.p, s.ev, x.product, x.url, x.snippet, x.calls")
     rows, ms = await gq(cy, {"ids": crits})
     cells, have = [], set()
-    for eid, cid, p, evn, prod, url, snip in rows:
-        if eid not in ENTITIES:
+    for eid, cid, p, evn, prod, url, snip, calls in rows:
+        if eid not in ENTITIES or (eid, cid) in have:
             continue
         cell = {"p": float(p), "src": "memory"}
         if prod:
             cell["evidence"] = {"product": prod, "url": url, "snippet": snip}
+            try:
+                cell["calls"] = json.loads(calls or "[]")
+            except ValueError:
+                pass
         session.cells[(eid, cid)] = cell
         have.add((eid, cid))
-        cells.append({"e": eid, "c": cid, "p": round(float(p), 4), "src": "memory", "evidence": cell.get("evidence")})
+        cells.append({"e": eid, "c": cid, "p": round(float(p), 4), "src": "memory", "evidence": cell.get("evidence"),
+                      "calls": cell.get("calls")})
     return cells, have, cy, ms
 
 
 def site_matches(e: dict, page: str) -> bool:
-    """A fetched 'official site' must talk about what this sponsor does, not just share its name."""
+    """False only when a substantial page shares nothing with the sponsor's own description (clearly another
+    company). Short, empty or JavaScript-only pages are inconclusive, so the remembered site is kept."""
     words = [w for w in keywords(e["description"]) if len(w) > 4 and w not in keywords(e["name"])][:25]
     text = page.lower()
-    return sum(1 for w in set(words) if w in text) >= 3
+    if len(text) < 2000 or len(words) < 4:
+        return True
+    return sum(1 for w in set(words) if w in text) >= (2 if len(set(words)) >= 8 else 1)
 
 
 _site_locks: dict[str, asyncio.Lock] = {}
@@ -770,7 +848,8 @@ async def rescore(session: Session, g: dict, snippet: str, url: str, product: st
 
 
 async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
-    for attempt in range(2):
+    # Keep retrying with a different Bright Data strategy until one yields evidence or all have been tried.
+    for attempt in range(len(STRATEGIES)):
         if attempt:
             ms = await route(session, [g])
             if not g["strategy"]:
@@ -786,12 +865,12 @@ async def fill_gap(session: Session, g: dict, out: asyncio.Queue):
         if ok:
             await rescore(session, g, snippet, url, product, out, calls)
             return
-    await out.put(ev("unresolved", e=g["e"], c=g["c"]))
+    await out.put(ev("unresolved", e=g["e"], c=g["c"], tries=len(session.tried.get((g["e"], g["c"]), []))))
 
 
 WHY_PATH = ("MATCH (u:User {id:$sid}), (e:Entity {id:$id}) "
             "WITH u, e, shortestPath((u)-[:WANTS|MAPS_TO|COVERS|PRESENTED_BY|WORKS_AT|EMPLOYS|PRESENTS*..7]->(e)) AS p "
-            "WHERE p IS NOT NULL "
+            "WHERE p IS NOT NULL AND relationships(p)[0].weight > 0 "
             "RETURN [n IN nodes(p) | [labels(n)[0], coalesce(n.id, ''), coalesce(n.name, n.text, '')]], "
             "[r IN relationships(p) | type(r)]")
 
@@ -841,8 +920,15 @@ async def turn(session: Session, text: str):
     yield ev("rubric", criteria=list(session.criteria.values()), scope=session.scope)
     yield ev("rank", rows=session.ranking())
 
+    try:
+        await gq("MATCH (u:User {id:$sid}) SET u.scope = $scope, u.now = $now "
+                 "CREATE (:Turn {text:$text, reply:$reply, at:timestamp()})-[:IN]->(u)",
+                 {"sid": session.sid, "scope": session.scope, "text": text, "reply": session.last_reply,
+                  "now": session.now.isoformat() if session.now else ""})
+    except Exception:
+        pass
     active = list(session.criteria)
-    added = [c for c in active if c not in before]
+    added = [c for c in active if c not in before or not any(k[1] == c for k in session.cells)]
     if session.scope != scope_before and not added and active:
         async for e in score_new(session, active):
             yield e
@@ -905,13 +991,15 @@ async def turn(session: Session, text: str):
                 yield await asyncio.wait_for(q.get(), timeout=0.25)
             except asyncio.TimeoutError:
                 pass
-        await done
-    try:
-        await gq("MATCH (u:User {id:$sid}) SET u.scope = $scope "
-                 "CREATE (:Turn {text:$text, reply:$reply, at:timestamp()})-[:IN]->(u)",
-                 {"sid": session.sid, "scope": session.scope, "text": text, "reply": session.last_reply})
-    except Exception:
-        pass
+        try:
+            await done
+        finally:
+            session.tasks = [t for t in session.tasks if t not in tasks]
+    if getattr(session, "want_calendar", False):
+        session.want_calendar = False
+        items = plan(session)
+        yield ev("calendar", url=f"api/calendar.ics?sid={session.sid}",
+                 items=[{"title": i["title"], "start": i["start"].strftime("%a %-I:%M %p"), "where": i["where"]} for i in items])
     items, cyphers, ms = await explain(session)
     if items:
         yield ev("why", items=items, cypher=cyphers, ms=ms)

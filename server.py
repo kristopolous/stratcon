@@ -54,7 +54,7 @@ async def turn(req: Request):
         s.tasks = []
         if s.tf_id and engine.config.TRUEFORGE_URL:
             try:
-                await engine.tf_client().sessions.cancel(session_id=s.tf_id)
+                await asyncio.wait_for(engine.tf_client().sessions.cancel(session_id=s.tf_id), 3)
             except Exception:
                 pass
         aborted = True
@@ -75,14 +75,21 @@ async def turn(req: Request):
         finally:
             await q.put(None)
 
-    s.current = asyncio.create_task(produce())
+    s.current = mine = asyncio.create_task(produce())
 
     async def stream():
-        while True:
-            e = await q.get()
-            if e is None:
-                break
-            yield f"data: {json.dumps(e)}\n\n"
+        try:
+            while True:
+                e = await q.get()
+                if e is None:
+                    break
+                yield f"data: {json.dumps(e)}\n\n"
+        finally:
+            if s.current is mine and not mine.done():
+                mine.cancel()
+                for t in s.tasks:
+                    t.cancel()
+                s.tasks = []
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -184,11 +191,12 @@ async def enrich(id: str):
         return JSONResponse({"error": "not a person"}, status_code=400)
     rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.linkedin, p.headline, p.profile_ms, p.socials, p.li_profile, "
                               "p.li_snapshot, p.li_ms, p.photo, p.photo_src", {"id": id})
-    if rows and (rows[0][0] or rows[0][3]):
+    if rows and (rows[0][0] or rows[0][3] is not None):
         out = {"linkedin": rows[0][0] or "", "headline": rows[0][1] or "", "cached": True, "ms": rows[0][2],
                "other": json.loads(rows[0][3]) if rows[0][3] else []}
         if rows[0][7]:
-            out["photo"] = {"url": rows[0][7], "source": rows[0][8] or "LinkedIn", "product": "graph memory"}
+            src = rows[0][8] or "LinkedIn"
+            out["photo"] = {"url": rows[0][7], "source": src, "product": "graph memory"}
         elif out["other"]:
             gh = await _github_photo(id, [o["url"] for o in out["other"]])
             if gh:
@@ -215,11 +223,11 @@ async def enrich(id: str):
            "product": "SERP API", "cached": False,
            "linkedin": hit["link"] if hit else "", "headline": (hit["title"] + " — " + hit["description"])[:300] if hit else "",
            "other": [{"title": x["title"], "url": x["link"], "snippet": x["description"][:200]} for x in socials]}
-    if hit or socials:
+    if r1.get("status") == 200 and r2.get("status") == 200:
         await engine.gq("MATCH (p {id:$id}) SET p.linkedin=$l, p.headline=$h, p.socials=$so, p.profile_ms=$ms",
                         {"id": id, "l": out["linkedin"], "h": out["headline"], "so": json.dumps(out["other"]),
                          "ms": max(r1["ms"], r2["ms"])})
-    gh = await _github_photo(id, [x["link"] for x in r2["results"]] + [x["url"] for x in out["other"]])
+    gh = await _github_photo(id, [x["url"] for x in out["other"]])
     if gh:
         out["photo"] = gh
     if hit:
@@ -231,66 +239,118 @@ LI_JOBS: dict[str, dict] = {}
 
 
 async def _github_photo(id: str, links: list[str]) -> dict | None:
-    """Bright Data Web Unlocker on the person's GitHub profile; the avatar is public even when LinkedIn's isn't."""
+    """Bright Data Web Unlocker on the person's GitHub profile; the avatar is public even when LinkedIn's isn't.
+    Only a profile whose page names this person is accepted."""
     import re as _re
     import brightdata
-    user = next((m.group(1) for l in links if (m := _re.match(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?$", l))
-                 and m.group(1).lower() not in ("orgs", "topics", "features", "about", "github")), None)
-    if not user:
-        return None
-    r = await brightdata._request(f"https://github.com/{user}", None)
-    m = _re.search(r"https://avatars\.githubusercontent\.com/u/\d+\?v=\d+", r[1]) if r[0] == 200 else None
-    if not m:
-        return None
-    out = {"url": m.group(0) + "&s=200", "source": f"github.com/{user}", "product": "Web Unlocker"}
-    await engine.gq("MATCH (p {id:$id}) SET p.photo = CASE WHEN p.photo IS NULL OR p.photo = '' THEN $u ELSE p.photo END, "
-                    "p.photo_src = CASE WHEN p.photo_src IS NULL THEN $src ELSE p.photo_src END",
-                    {"id": id, "u": out["url"], "src": out["source"]})
-    if id in engine.ENTITIES and not engine.ENTITIES[id].get("logo"):
-        engine.ENTITIES[id]["logo"] = out["url"]
-    return out
+    e = engine.ENTITIES.get(id) or {}
+    name = (e.get("name") or "").lower()
+    last = name.split()[-1] if name else ""
+    users = []
+    for l in links:
+        l = l.strip()
+        if not l.startswith("http"):
+            l = "https://" + l.lstrip("/")
+        m = _re.match(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?(?:[?#].*)?$", l)
+        if m and m.group(1).lower() not in ("orgs", "topics", "features", "about", "github", "sponsors", "settings") \
+                and m.group(1) not in users:
+            users.append(m.group(1))
+    for user in users[:2]:
+        try:
+            status, html = await brightdata._request(f"https://github.com/{user}", None)
+        except Exception:
+            return None
+        if status != 200 or (last and last not in html.lower()):
+            continue
+        m = _re.search(r"https://avatars\.githubusercontent\.com/u/\d+\?v=\d+", html)
+        if not m:
+            continue
+        out = {"url": m.group(0) + "&s=200", "source": f"github.com/{user}", "product": "Web Unlocker"}
+        await engine.gq("MATCH (p {id:$id}) SET p.photo = CASE WHEN p.photo IS NULL OR p.photo = '' THEN $u ELSE p.photo END, "
+                        "p.photo_src = CASE WHEN p.photo IS NULL OR p.photo = '' OR p.photo = $u THEN $src ELSE p.photo_src END",
+                        {"id": id, "u": out["url"], "src": out["source"]})
+        if id in engine.ENTITIES and not engine.ENTITIES[id].get("logo"):
+            engine.ENTITIES[id]["logo"] = out["url"]
+        return out
+    return None
+
+
+LI_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 async def _linkedin(id: str, url: str) -> dict:
-    """Bright Data Web Scraper API, LinkedIn people profiles: trigger once, then report progress until ready."""
+    """Bright Data Web Scraper API, LinkedIn people profiles: trigger once (resuming a snapshot saved in the graph
+    after a restart), report progress until ready or failed, never trigger two scrapes for one person."""
     import time as _t
     import brightdata
-    job = LI_JOBS.get(id)
-    if job and job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
-        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
-        job.update({"snapshot": sid, "started": _t.time(), "retried": True})
-    if not job:
-        sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
-        job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
-    if job["status"] == "running":
-        prog = await brightdata.snapshot_progress(job["snapshot"])
-        job["status"] = {"ready": "ready", "failed": "failed"}.get(prog.get("status"), "running")
-        if job["status"] == "ready":
-            rec = (await brightdata.snapshot_download(job["snapshot"]))[0]
-            photo = "" if rec.get("default_avatar") else (rec.get("avatar") or "")
-            comp = rec.get("current_company") or {}
-            job["profile"] = {"name": rec.get("name"), "photo": photo, "about": (rec.get("about") or "")[:400],
-                              "company": comp.get("name") if isinstance(comp, dict) else rec.get("current_company_name"),
-                              "city": rec.get("city"), "followers": rec.get("followers"), "url": rec.get("url") or url,
-                              "position": rec.get("position")}
-            job["ms"] = int((_t.time() - job["started"]) * 1000)
-            await engine.gq("MATCH (p {id:$id}) SET p.li_profile=$j, p.photo=$ph, p.li_snapshot=$sid, p.li_ms=$ms",
+    async with LI_LOCKS.setdefault(id, asyncio.Lock()):
+        job = LI_JOBS.get(id)
+        try:
+            if not job:
+                rows, _ = await engine.gq("MATCH (p {id:$id}) RETURN p.li_pending, p.li_pending_at", {"id": id})
+                if rows and rows[0][0]:
+                    job = LI_JOBS[id] = {"snapshot": rows[0][0], "started": (rows[0][1] or _t.time() * 1000) / 1000,
+                                         "status": "running", "url": url}
+                else:
+                    sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": url}])
+                    job = LI_JOBS[id] = {"snapshot": sid, "started": _t.time(), "status": "running", "url": url}
+                    await engine.gq("MATCH (p {id:$id}) SET p.li_pending=$s, p.li_pending_at=timestamp()",
+                                    {"id": id, "s": sid})
+            if job["status"] == "running" and _t.time() - job["started"] > 240 and not job.get("retried"):
+                sid = await brightdata.dataset_trigger(brightdata.LINKEDIN_PEOPLE, [{"url": job["url"]}])
+                job.update({"snapshot": sid, "started": _t.time(), "retried": True})
+                await engine.gq("MATCH (p {id:$id}) SET p.li_pending=$s, p.li_pending_at=timestamp()", {"id": id, "s": sid})
+            if job["status"] == "running":
+                prog = await brightdata.snapshot_progress(job["snapshot"])
+                st = prog.get("status")
+                if prog.get("transient"):
+                    pass
+                elif st == "failed" or prog.get("errors") and not prog.get("records"):
+                    job["status"], job["error"] = "failed", str(prog.get("error") or prog.get("errors"))[:200]
+                elif st == "ready":
+                    recs = await brightdata.snapshot_download(job["snapshot"])
+                    rec = recs[0] if recs and isinstance(recs[0], dict) else {}
+                    if not rec or rec.get("error") or not rec.get("name"):
+                        job["status"], job["error"] = "failed", str(rec.get("error") or "no profile returned")[:200]
+                    else:
+                        photo = "" if rec.get("default_avatar") else (rec.get("avatar") or "")
+                        comp = rec.get("current_company") or {}
+                        job["profile"] = {"name": rec.get("name"), "photo": photo, "about": (rec.get("about") or "")[:400],
+                                          "company": comp.get("name") if isinstance(comp, dict) else rec.get("current_company_name"),
+                                          "city": rec.get("city"), "followers": rec.get("followers"),
+                                          "url": rec.get("url") or url, "position": rec.get("position")}
+                        job["status"] = "ready"
+                        job["ms"] = int((_t.time() - job["started"]) * 1000)
+                        await engine.gq(
+                            "MATCH (p {id:$id}) SET p.li_profile=$j, p.li_snapshot=$sid, p.li_ms=$ms, p.li_pending=null, "
+                            "p.photo = CASE WHEN $ph <> '' THEN $ph ELSE p.photo END, "
+                            "p.photo_src = CASE WHEN $ph <> '' THEN 'LinkedIn' ELSE p.photo_src END",
                             {"id": id, "j": json.dumps(job["profile"]), "ph": photo, "sid": job["snapshot"], "ms": job["ms"]})
-            if photo and id in engine.ENTITIES:
-                engine.ENTITIES[id]["logo"] = photo
+                        if photo and id in engine.ENTITIES:
+                            engine.ENTITIES[id]["logo"] = photo
+        except Exception as x:
+            if job and job.get("snapshot"):  # transient: keep polling the same snapshot next time
+                job["error"] = f"{type(x).__name__}: {str(x)[:160]}"
+            else:
+                job = {"snapshot": None, "started": _t.time(), "status": "failed",
+                       "error": f"{type(x).__name__}: {str(x)[:160]}"}
+                LI_JOBS[id] = job
+        if job["status"] == "failed":
+            await engine.gq("MATCH (p {id:$id}) SET p.li_pending=null", {"id": id})
     return {"product": "Web Scraper API · LinkedIn people profiles", "dataset": "gd_l1viktl72bvl7bjuj0",
-            "snapshot": job["snapshot"], "status": job["status"], "elapsed": int(_t.time() - job["started"]),
-            "profile": job.get("profile"), "ms": job.get("ms")}
+            "snapshot": job.get("snapshot"), "status": job["status"], "elapsed": int(_t.time() - job["started"]),
+            "profile": job.get("profile"), "ms": job.get("ms"), "error": job.get("error")}
 
 
 @app.get("/api/topic")
 async def topic(sid: str, id: str):
     cy = ("MATCH (t:Topic {id:$id})-[c:COVERS]->(e:Entity) "
-          "RETURN t.name, e.id, e.name, e.kind, c.p ORDER BY c.p DESC LIMIT 40")
+          "RETURN t.name, e.id, e.name, e.kind, c.p ORDER BY c.p DESC LIMIT 200")
     rows, ms = await engine.gq(cy, {"id": id})
+    total, _ = await engine.gq("MATCH (:Topic {id:$id})-[:COVERS]->(e:Entity) RETURN count(e)", {"id": id})
     s = session(sid)
     scores = {r["id"]: r["score"] for r in s.ranking(everything=True)}
-    return JSONResponse({"name": rows[0][0] if rows else id, "cypher": cy, "ms": ms,
+    return JSONResponse({"name": rows[0][0] if rows else id, "cypher": cy, "ms": ms, "total": total[0][0] if total else len(rows),
                          "entities": [{"id": i, "name": n, "kind": k, "p": p, "score": scores.get(i, 0)} for _, i, n, k, p in rows]})
 
 
@@ -320,21 +380,50 @@ async def sessions_list():
 @app.get("/api/session/load")
 async def session_load(sid: str):
     """Rebuild a past session entirely from the graph: no agent, no decision model, no fetches."""
+    live = sessions.get(sid)
     s = engine.Session(sid)
-    sessions[sid] = s
-    cy1 = "MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) RETURN u.scope, u.pins, c.id, c.text, w.weight"
+    if live and getattr(live, "current", None) and not live.current.done():
+        s = live
+    else:
+        sessions[sid] = s
+    cy1 = ("MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) "
+           "RETURN u.scope, u.pins, u.now, c.id, c.text, w.weight")
     rows, ms1 = await engine.gq(cy1, {"sid": sid})
-    for scope, pins, cid, text, w in rows:
+    for scope, pins, now, cid, text, w in ([] if s is live else rows):
         s.scope = scope or "all"
         s.pins = [p for p in (pins or []) if p in engine.ENTITIES]
+        if now:
+            from datetime import datetime
+            s.now = datetime.fromisoformat(now)
         if cid:
             s.criteria[cid] = {"id": cid, "text": text, "weight": w}
-    cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
+    if s is live:
+        cells = [{"e": e, "c": c, "p": round(v["p"], 4), "src": v.get("src"), "evidence": v.get("evidence"),
+                  "calls": v.get("calls")} for (e, c), v in s.cells.items() if c in s.criteria]
+        cy2, ms2 = "", 0
+    else:
+        cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
     cy3 = "MATCH (t:Turn)-[:IN]->(:User {id:$sid}) RETURN t.text, t.reply ORDER BY t.at"
     turns, ms3 = await engine.gq(cy3, {"sid": sid})
+    if s is not live:
+        for a, b in turns:
+            s.history += [{"role": "user", "content": a or ""}, {"role": "assistant", "content": b or ""}]
     return JSONResponse({"sid": sid, "criteria": list(s.criteria.values()), "scope": s.scope, "pins": s.pins,
                          "cells": cells, "rows": s.ranking(), "turns": [{"text": a, "reply": b} for a, b in turns],
                          "queries": [{"cypher": c, "ms": m} for c, m in ((cy1, ms1), (cy2, ms2), (cy3, ms3)) if c]})
+
+
+@app.post("/api/pins")
+async def save_pins(req: Request):
+    body = await req.json()
+    s = session(body["sid"])
+    rev = int(body.get("rev", 0))
+    if rev and rev < getattr(s, "pin_rev", 0):
+        return JSONResponse({"ok": False, "stale": True, "pins": s.pins})
+    s.pin_rev = rev
+    s.pins = [p for p in body.get("pins", []) if p in engine.ENTITIES]
+    await engine.gq("MERGE (u:User {id:$sid}) SET u.pins = $pins", {"sid": body["sid"], "pins": s.pins})
+    return JSONResponse({"ok": True, "pins": s.pins})
 
 
 @app.get("/api/calendar.ics")
