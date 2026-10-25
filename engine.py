@@ -220,6 +220,7 @@ class Session:
         self.calls: dict[str, list] = {}
         self.pins: list[str] = []
         self.last_reply = ""
+        self.tf_seeded = False
 
     def entities(self, everything: bool = False):
         pool = ENTITIES.values() if everything else self._scoped()
@@ -339,6 +340,11 @@ async def agent_trueforge(session: "Session", text: str):
     session.ops = []
     ACTIVE = session
     rubric = [{"id": k["id"], "text": k["text"], "weight": k["weight"]} for k in session.criteria.values()]
+    earlier = ""
+    if session.history and not session.tf_seeded:
+        earlier = "Earlier in this conversation:\n" + "\n".join(
+            f"{h['role']}: {h['content'][:300]}" for h in session.history[-6:]) + "\n\n"
+    session.tf_seeded = True
     reply, status = "", ""
     calls: dict[tuple, dict] = {}
     by_id: dict[str, dict] = {}
@@ -347,7 +353,7 @@ async def agent_trueforge(session: "Session", text: str):
         res = c.sessions.create_turn_stream(
             session_id=session.tf_id,
             input=[t.UserMessage(type="user.message",
-                                 content=f"Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
+                                 content=f"{earlier}Current rubric: {json.dumps(rubric)}\nScope: {session.scope}\n"
                                          f"Pinned by attendee: {json.dumps([ENTITIES[p]['name'] for p in session.pins])}\n"
                                          f"Attendee says: {text}")])
         if inspect.isawaitable(res):
@@ -582,11 +588,13 @@ async def score_cells(session: Session, crits: list[str], ents: list[dict]):
 async def recall(session: Session, crits: list[str]):
     cy = ("MATCH (e:Entity)-[s:SCORED]->(c:Criterion) WHERE c.id IN $ids "
           "OPTIONAL MATCH (x:Evidence)-[:ABOUT]->(e) WHERE (x)-[:INFORMS]->(c) "
+          "WITH e, c, s, x ORDER BY x.at DESC "
+          "WITH e, c, s, collect(x)[0] AS x "
           "RETURN e.id, c.id, s.p, s.ev, x.product, x.url, x.snippet")
     rows, ms = await gq(cy, {"ids": crits})
     cells, have = [], set()
     for eid, cid, p, evn, prod, url, snip in rows:
-        if eid not in ENTITIES:
+        if eid not in ENTITIES or (eid, cid) in have:
             continue
         cell = {"p": float(p), "src": "memory"}
         if prod:
@@ -598,10 +606,13 @@ async def recall(session: Session, crits: list[str]):
 
 
 def site_matches(e: dict, page: str) -> bool:
-    """A fetched 'official site' must talk about what this sponsor does, not just share its name."""
+    """False only when a substantial page shares nothing with the sponsor's own description (clearly another
+    company). Short, empty or JavaScript-only pages are inconclusive, so the remembered site is kept."""
     words = [w for w in keywords(e["description"]) if len(w) > 4 and w not in keywords(e["name"])][:25]
     text = page.lower()
-    return sum(1 for w in set(words) if w in text) >= 3
+    if len(text) < 2000 or len(words) < 4:
+        return True
+    return sum(1 for w in set(words) if w in text) >= 1
 
 
 _site_locks: dict[str, asyncio.Lock] = {}
@@ -841,6 +852,13 @@ async def turn(session: Session, text: str):
     yield ev("rubric", criteria=list(session.criteria.values()), scope=session.scope)
     yield ev("rank", rows=session.ranking())
 
+    try:
+        await gq("MATCH (u:User {id:$sid}) SET u.scope = $scope, u.now = $now "
+                 "CREATE (:Turn {text:$text, reply:$reply, at:timestamp()})-[:IN]->(u)",
+                 {"sid": session.sid, "scope": session.scope, "text": text, "reply": session.last_reply,
+                  "now": session.now.isoformat() if session.now else ""})
+    except Exception:
+        pass
     active = list(session.criteria)
     added = [c for c in active if c not in before]
     if session.scope != scope_before and not added and active:
@@ -906,12 +924,6 @@ async def turn(session: Session, text: str):
             except asyncio.TimeoutError:
                 pass
         await done
-    try:
-        await gq("MATCH (u:User {id:$sid}) SET u.scope = $scope "
-                 "CREATE (:Turn {text:$text, reply:$reply, at:timestamp()})-[:IN]->(u)",
-                 {"sid": session.sid, "scope": session.scope, "text": text, "reply": session.last_reply})
-    except Exception:
-        pass
     items, cyphers, ms = await explain(session)
     if items:
         yield ev("why", items=items, cypher=cyphers, ms=ms)

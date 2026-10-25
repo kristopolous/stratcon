@@ -286,11 +286,12 @@ async def _linkedin(id: str, url: str) -> dict:
 @app.get("/api/topic")
 async def topic(sid: str, id: str):
     cy = ("MATCH (t:Topic {id:$id})-[c:COVERS]->(e:Entity) "
-          "RETURN t.name, e.id, e.name, e.kind, c.p ORDER BY c.p DESC LIMIT 40")
+          "RETURN t.name, e.id, e.name, e.kind, c.p ORDER BY c.p DESC LIMIT 200")
     rows, ms = await engine.gq(cy, {"id": id})
+    total, _ = await engine.gq("MATCH (:Topic {id:$id})-[:COVERS]->(e:Entity) RETURN count(e)", {"id": id})
     s = session(sid)
     scores = {r["id"]: r["score"] for r in s.ranking(everything=True)}
-    return JSONResponse({"name": rows[0][0] if rows else id, "cypher": cy, "ms": ms,
+    return JSONResponse({"name": rows[0][0] if rows else id, "cypher": cy, "ms": ms, "total": total[0][0] if total else len(rows),
                          "entities": [{"id": i, "name": n, "kind": k, "p": p, "score": scores.get(i, 0)} for _, i, n, k, p in rows]})
 
 
@@ -320,21 +321,41 @@ async def sessions_list():
 @app.get("/api/session/load")
 async def session_load(sid: str):
     """Rebuild a past session entirely from the graph: no agent, no decision model, no fetches."""
+    live = sessions.get(sid)
     s = engine.Session(sid)
-    sessions[sid] = s
-    cy1 = "MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) RETURN u.scope, u.pins, c.id, c.text, w.weight"
+    if live and getattr(live, "current", None) and not live.current.done():
+        s = live
+    else:
+        sessions[sid] = s
+    cy1 = ("MATCH (u:User {id:$sid}) OPTIONAL MATCH (u)-[w:WANTS]->(c:Criterion) "
+           "RETURN u.scope, u.pins, u.now, c.id, c.text, w.weight")
     rows, ms1 = await engine.gq(cy1, {"sid": sid})
-    for scope, pins, cid, text, w in rows:
+    for scope, pins, now, cid, text, w in rows:
         s.scope = scope or "all"
         s.pins = [p for p in (pins or []) if p in engine.ENTITIES]
+        if now:
+            from datetime import datetime
+            s.now = datetime.fromisoformat(now)
         if cid:
             s.criteria[cid] = {"id": cid, "text": text, "weight": w}
     cells, _, cy2, ms2 = await engine.recall(s, list(s.criteria)) if s.criteria else ([], None, "", 0)
     cy3 = "MATCH (t:Turn)-[:IN]->(:User {id:$sid}) RETURN t.text, t.reply ORDER BY t.at"
     turns, ms3 = await engine.gq(cy3, {"sid": sid})
+    if s is not live:
+        for a, b in turns:
+            s.history += [{"role": "user", "content": a or ""}, {"role": "assistant", "content": b or ""}]
     return JSONResponse({"sid": sid, "criteria": list(s.criteria.values()), "scope": s.scope, "pins": s.pins,
                          "cells": cells, "rows": s.ranking(), "turns": [{"text": a, "reply": b} for a, b in turns],
                          "queries": [{"cypher": c, "ms": m} for c, m in ((cy1, ms1), (cy2, ms2), (cy3, ms3)) if c]})
+
+
+@app.post("/api/pins")
+async def save_pins(req: Request):
+    body = await req.json()
+    s = session(body["sid"])
+    s.pins = [p for p in body.get("pins", []) if p in engine.ENTITIES]
+    await engine.gq("MERGE (u:User {id:$sid}) SET u.pins = $pins", {"sid": body["sid"], "pins": s.pins})
+    return JSONResponse({"ok": True, "pins": s.pins})
 
 
 @app.get("/api/calendar.ics")
