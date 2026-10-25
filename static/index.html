@@ -7,6 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
 :root{
   --bg:#0b0d10; --panel:#11141a; --line:#1f242d; --text:#e6e9ef; --dim:#8a93a3; --faint:#4a5160;
@@ -40,7 +42,7 @@ header span{color:var(--dim);font-size:13px}
 #calbtn{background:#152019;border:1px solid #2f6b52;color:var(--yes);padding:6px 12px;border-radius:6px;font:12.5px Inter;cursor:pointer}
 #calbtn:disabled{opacity:.35;cursor:default}
 #calbtn:not(:disabled):hover{border-color:var(--yes)}
-#status{grid-column:1/4;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);padding:6px 18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#status{grid-column:1/4;background:var(--panel);border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);padding:6px 18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #status.busy::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--gap);margin-right:8px;animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.2}}
 
@@ -56,7 +58,8 @@ header span{color:var(--dim);font-size:13px}
 .tool.rw{border-left-color:var(--gap)}.tool.rw .fn{color:var(--gap)}
 .tool.meta{border-left-color:#3a4250;color:var(--dim)}.tool.meta .fn{color:#8a93a3}
 .tool .via{color:var(--faint)}
-.reply{color:var(--dim);font-size:13px}
+.reply{color:#c3cad6;font-size:13px;line-height:1.5}
+.reply p{margin:0 0 6px}.reply ul,.reply ol{margin:4px 0 6px 18px}.reply li{margin:2px 0}.reply strong{color:var(--text)}.reply code{font:12px var(--mono);background:#151a22;padding:1px 4px;border-radius:3px}.reply a{color:#7aa2ff}
 .thinking{font:12px var(--mono);color:var(--faint)}
 .compose{padding:12px;border-top:1px solid var(--line)}
 .sugg{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
@@ -103,8 +106,8 @@ header span{color:var(--dim);font-size:13px}
 .ch .w{height:4px;background:#1c212a;border-radius:2px;overflow:hidden}
 .ch .w i{display:block;height:100%;background:var(--crit);transition:width .8s}
 .ch.neg .w i{background:#e5636b}
-#rows{position:relative;flex:1;overflow-y:auto;overflow-x:hidden}
-.row{position:absolute;left:0;right:0;height:var(--rh);padding:0 16px;gap:8px;border-bottom:1px solid #161a21;transition:transform .7s cubic-bezier(.2,.8,.2,1),opacity .5s}
+#rows{position:relative;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden}
+.row{position:absolute;top:0;left:0;right:0;height:var(--rh);padding:0 16px;gap:8px;border-bottom:1px solid #161a21;transition:transform .7s cubic-bezier(.2,.8,.2,1),opacity .5s}
 .row{cursor:pointer}.row:hover{background:#10141a}
 .row .rk{font:600 13px var(--mono);color:var(--faint);display:flex;align-items:center;gap:4px}
 .pin{cursor:pointer;color:var(--faint);font-size:11px}.pin:hover{color:var(--gap)}
@@ -217,7 +220,8 @@ header span{color:var(--dim);font-size:13px}
 <script>
 const RH = 66, SHOW = 12;
 document.documentElement.style.setProperty('--rh', RH + 'px');
-let sid = 's' + Math.random().toString(36).slice(2, 9);
+let sid = (location.hash.match(/s=([A-Za-z0-9_-]+)/) || [])[1] || 's' + Math.random().toString(36).slice(2, 9);
+const resumeOnLoad = /s=/.test(location.hash);
 const E = {}; let crits = [], rank = [], cells = {}, rowEls = {}, busy = false, t0 = 0, tfBox = null; const pins = new Set();
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -247,6 +251,9 @@ function trace(k, cls, html) {
   d.innerHTML = `<span class="k ${cls}">${k}</span>${html}`;
   $('#trace').prepend(d);
   while ($('#trace').children.length > 120) $('#trace').lastChild.remove();
+}
+function md(text) {
+  try { return DOMPurify.sanitize(marked.parse(String(text || ''), {breaks: true})); } catch { return esc(text); }
 }
 function chat(html, cls) {
   const d = document.createElement('div'); d.className = cls; d.innerHTML = html;
@@ -324,7 +331,9 @@ function doRender() {
       ${i < 3 && because(r.id) ? `<div class="why">${esc(because(r.id))}</div>` : `<div class="m">${esc(e.kind === 'speaker' ? e.org + ' · featured speaker' : e.kind === 'person' ? (e.tier ? e.tier + ' · ' : '') + e.org : e.kind === 'talk' ? (e.when || '') + (e.room ? ' · ' + e.room : '') : e.tier + ' sponsor')}</div>`}</div></div>
       <div class="score">${(r.score * 100).toFixed(0)}</div>` + crits.map(c => cellHTML(r.id, c)).join('');
   });
-  box.style.minHeight = top.length * RH + 'px';
+  let sizer = document.getElementById('rowsizer');
+  if (!sizer) { sizer = document.createElement('div'); sizer.id = 'rowsizer'; sizer.style.cssText = 'width:1px;pointer-events:none'; box.append(sizer); }
+  sizer.style.height = top.length * RH + 'px';
 }
 
 $('#rows').addEventListener('click', ev => {
@@ -493,7 +502,7 @@ function handle(ev) {
       if (ev.via && tfBox) {
         tfBox.querySelector('.thinking')?.remove();
         tfBox.querySelector('.model').textContent = `${ev.via} agent · ${ev.model} · ${(ev.ms / 1000).toFixed(1)}s`;
-        tfBox.insertAdjacentHTML('beforeend', `<div class="reply">${esc(ev.reply)}</div>`);
+        tfBox.insertAdjacentHTML('beforeend', `<div class="reply">${md(ev.reply)}</div>`);
         trace(s, 'ag', `${esc(ev.via)} turn ${esc(ev.status)} · ${(ev.ops || []).length} tool calls executed (${ev.ms}ms)`);
         tfBox = null; break;
       }
@@ -504,7 +513,7 @@ function handle(ev) {
         o.op === 'reweight' ? `<div class="tool rw"><span class="fn">reweight</span>("${esc(crits.find(c => c.id === o.id)?.text || o.id)}", ${crits.find(c => c.id === o.id)?.weight} → ${o.weight})</div>` :
         o.op === 'clock' ? `<div class="tool rw"><span class="fn">set_clock</span>("${esc(o.value)}")</div>` :
         o.op === 'calendar' ? `<div class="tool"><span class="fn">export_calendar</span>()</div>` :
-        `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${esc(ev.reply)}</div>`, 'a');
+        `<div class="tool"><span class="fn">set_scope</span>("${esc(o.value)}")</div>`).join('') + `<div class="reply">${md(ev.reply)}</div>`, 'a');
       trace(s, 'ag', `${esc(ev.model)} → ${(ev.ops || []).length} tool calls (${ev.ms}ms)`);
       break;
     case 'topics': {
@@ -638,6 +647,7 @@ async function send(text) {
   if (!text.trim()) return;
   if (busy && ctrl) { ctrl.abort(); document.querySelector('.a.pending')?.remove(); }
   busy = true; t0 = Date.now() / 1000;
+  if (!location.hash.includes(sid)) history.replaceState(null, '', '#s=' + sid);
   if (CLARIFY[text]) { NEXT = [CLARIFY[text], ...NEXT.filter(n => !Object.values(CLARIFY).includes(n))]; nextI = 0; }
   const used = NEXT.indexOf(text); if (used >= nextI) nextI = used + 1;
   document.querySelectorAll('.next').forEach(b => b.remove());
@@ -683,15 +693,15 @@ $('#menu').addEventListener('click', openSide);
 $('#sideclose').addEventListener('click', closeSide);
 $('#sidebg').addEventListener('click', closeSide);
 $('#sesslist').addEventListener('click', e => { const x = e.target.closest('[data-session]'); if (x) { closeSide(); loadSession(x.dataset.session); } });
-$('#newsess').addEventListener('click', () => location.reload());
+$('#newsess').addEventListener('click', () => { history.replaceState(null, '', location.pathname); location.reload(); });
 async function loadSession(id) {
   const t = Date.now();
   const d = await (await fetch(`api/session/load?sid=${encodeURIComponent(id)}`)).json();
-  sid = d.sid; crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
+  sid = d.sid; history.replaceState(null, '', '#s=' + sid); crits = d.criteria; cells = {}; rank = d.rows; pins.clear(); d.pins.forEach(p => pins.add(p));
   Object.keys(why).forEach(k => delete why[k]);
   d.cells.forEach(c => setCell(c.e, c.c, {p: c.p, src: c.evidence ? 'evidence' : 'model', evidence: c.evidence || null, state: 'done'}));
   $('#log').innerHTML = ''; Object.values(rowEls).forEach(el => el.remove()); for (const k in rowEls) delete rowEls[k];
-  d.turns.forEach(x => { chat(esc(x.text), 'u'); if (x.reply) chat(`<span class="model">from graph memory</span><div class="reply">${esc(x.reply)}</div>`, 'a'); });
+  d.turns.forEach(x => { chat(esc(x.text), 'u'); if (x.reply) chat(`<span class="model">from graph memory</span><div class="reply">${md(x.reply)}</div>`, 'a'); });
   $('#empty').style.display = 'none'; renderHead(); render(); refreshGraph();
   $('#calbtn').disabled = !rank.some(r => r.score > 0);
   $('#drawer').classList.remove('on');
@@ -712,6 +722,7 @@ async function lookupPeople() {
     if (pr) trace('', 'bd', `LinkedIn ✓ ${esc(pr.name || E[r.id].name)}${pr.company ? ' · ' + esc(pr.company) : ''}${pr.photo ? ' · photo' : ''}`);
   }
 }
+if (resumeOnLoad) setTimeout(() => loadSession(sid), 0);
 function offerNext() {
   if (nextI >= NEXT.length) return;
   const b = document.createElement('button'); b.className = 'next'; b.textContent = NEXT[nextI];

@@ -264,7 +264,7 @@ ops are any of:
   {"op":"clock","value":"2026-10-28T14:00"}   (when the attendee says what day/time it is at the conference; \
 the conference runs Oct 28-29, 2026)
   {"op":"calendar"}   (when the attendee asks to export, save or add their plan to a calendar)
-Rules: at most 5 criteria in total. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). "Which talks/sessions" means scope talks; "which booths/sponsors" means \
+Rules: Be EAGER to rank: whenever the attendee expresses any goal, interest, preference or constraint, even phrased as a question (\"what about X?\", \"anything on Y?\", \"I want to keep up with Z\"), add or adjust criteria so the board re-ranks. When in doubt, add a criterion. At most 5 criteria in total. Default to ADDING criteria: when the attendee adds detail or another signal ("I mean look for X", "that would help", "also"), add it and keep the existing ones. Only remove a criterion when the attendee says it was a mistake or explicitly drops it ("no, not that", "forget X", "instead of X"). "Which talks/sessions" means scope talks; "which booths/sponsors" means \
 scope sponsors; "which speakers" / "who should I meet" / "people" means scope speakers; "everything" means scope all. When the attendee changes their mind, edit existing criteria instead of \
 piling on: "matters less" / "more important" means reweight; "forget" / "drop" / "no longer" means remove. \
 If they bring back something from earlier in the conversation, add it back with the same wording as before. Phrase each criterion concretely in 8 words or fewer so it can be checked against a company description."""
@@ -290,8 +290,9 @@ async def agent(session: Session, text: str) -> tuple[dict, int]:
     return out, int((time.time() - t) * 1000)
 
 
-TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """If the attendee ASKS A QUESTION about the recommendations (e.g. "what positions are they hiring for?", "who \
-works there?"), do NOT edit the rubric: call current_recommendations, then research (live web via Bright Data) \
+EAGER = ('Be EAGER to rank: whenever the attendee expresses any goal, interest, preference or constraint, even phrased as a question ("what about X?", "anything on Y?", "I want to keep up with Z"), add or adjust criteria so the board re-ranks. When in doubt, add a criterion. ')
+TF_PROMPT = AGENT_PROMPT.split("Given the current rubric")[0] + """""" + EAGER + """Only a pure question about the CURRENT picks (e.g. "what positions are they hiring for?", "who \
+is this person?") leaves the rubric alone: call current_recommendations, then research (live web via Bright Data) \
 and/or graph_query (read-only FalkorDB Cypher), and answer in 2-3 sentences naming sources. \
 Edit the rubric only through the stratcon tools: \
 add_criterion, reweight, remove_criterion, set_scope, set_clock (when they say what day/time it is at the \
@@ -596,6 +597,13 @@ async def recall(session: Session, crits: list[str]):
     return cells, have, cy, ms
 
 
+def site_matches(e: dict, page: str) -> bool:
+    """A fetched 'official site' must talk about what this sponsor does, not just share its name."""
+    words = [w for w in keywords(e["description"]) if len(w) > 4 and w not in keywords(e["name"])][:25]
+    text = page.lower()
+    return sum(1 for w in set(words) if w in text) >= 3
+
+
 _site_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -693,8 +701,16 @@ async def execute(session: Session, g: dict, out: asyncio.Queue):
             await out.put(ev("fetch", e=e["id"], c=g["c"], strategy=s, product=product, target=e["url"]))
             r = await (brightdata.unlocker(e["url"]) if s == "read_site" else brightdata.browser(e["url"]))
             hits.append(r)
-            snippet = passages(r["text"], kws)
-            url = e["url"]
+            if not site_matches(e, r.get("text", "")):
+                bad = e["url"]
+                e["url"] = ""
+                await gq("MATCH (e:Entity {id:$id}) SET e.url = ''", {"id": e["id"]})
+                await out.put(ev("graph", op="forget_site", cypher="MATCH (e:Entity {id:$id}) SET e.url = ''", ms=0,
+                                 e=e["id"], url=bad))
+                snippet, url = "", bad
+            else:
+                snippet = passages(r["text"], kws)
+                url = e["url"]
     if s in ("web_search", "people_search") and hits:
         snippet, url = serp_evidence(hits[-1]["results"], e, kws)
     last = hits[-1] if hits else {"product": "?", "ms": 0, "bytes": 0}
